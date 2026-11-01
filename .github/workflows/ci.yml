@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    container: rust:1.92-trixie
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Install native dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git g++ pkg-config libgtk-4-dev libssl-dev ca-certificates fonts-dejavu-core
+      - uses: actions/checkout@v4
+      - name: Install formatter
+        run: rustup component add rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Test
+        run: cargo test --locked
+      - name: Build release
+        run: cargo build --release --locked
+      - name: Check CLI
+        run: |
+          ./target/release/sharpshot --version
+          ./target/release/sharpshot --help

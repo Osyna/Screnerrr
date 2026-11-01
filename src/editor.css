@@ -1,0 +1,159 @@
+/* Loaded at USER+1 by chrome::install, above the user's gtk.css and any GTK_THEME/settings theme.
+   Every declaration here must beat those providers, so the base block resets what external themes
+   commonly paint and each control then restates its own look; state rules must stay more specific
+   than the base rule they refine. */
+@define-color ss_surface #0d1215;
+@define-color ss_canvas #181f23;
+@define-color ss_hover #222e34;
+@define-color ss_text #e7eef0;
+@define-color ss_muted #a6b7bf;
+@define-color ss_border #2b3c43;
+@define-color ss_accent #63ddd5;
+@define-color ss_selected #173a3d;
+@define-color ss_selection #1f5b5e;
+@define-color ss_dim #607078;
+@define-color ss_shadow rgba(0, 0, 0, 0.5);
+
+/* Window and decoration geometry. Descendant rules below never match the window node itself. */
+window.sharpshot { background-color: @ss_surface; background-image: none; color: @ss_text; font-family: "Adwaita Sans", Cantarell, "Noto Sans", sans-serif; font-size: medium; font-style: normal; font-weight: 400; text-shadow: none; -gtk-icon-shadow: none; border: 0; padding: 0; }
+window.sharpshot.csd { margin: 0; border-radius: 8px 8px 0 0; box-shadow: 0 3px 9px 1px @ss_shadow, 0 0 0 1px @ss_border; }
+window.sharpshot.csd.dialog { border-radius: 8px; }
+window.sharpshot.maximized, window.sharpshot.fullscreen { border-radius: 0; box-shadow: none; }
+window.sharpshot.tiled, window.sharpshot.tiled-top, window.sharpshot.tiled-left, window.sharpshot.tiled-right, window.sharpshot.tiled-bottom { border-radius: 0; box-shadow: 0 0 0 1px @ss_border; }
+
+/* GTK measures some controls before parenting them under the application window. */
+* { font-family: "Adwaita Sans", Cantarell, "Noto Sans", sans-serif; font-size: medium; font-style: normal; font-weight: 400; }
+
+/* Base reset: inheritable text properties are pinned through `inherit`, decoration is cleared. */
+.sharpshot * { color: inherit; font-family: inherit; font-size: inherit; font-style: inherit; font-weight: inherit; background-color: transparent; background-image: none; border: 0 solid transparent; border-radius: 0; border-spacing: 0; margin: 0; padding: 0; min-width: 0; min-height: 0; box-shadow: none; text-shadow: none; -gtk-icon-shadow: none; -gtk-icon-size: 16px; outline: 0 solid transparent; outline-offset: 0; transition: none; animation: none; }
+
+/* Keyboard focus: one ring, shown instantly. Text fields show it while focused; the canvas is exempt. */
+.sharpshot *:focus-visible { outline: 2px solid @ss_accent; outline-offset: 2px; }
+.sharpshot entry:focus-within, .sharpshot spinbutton:focus-within { outline: 2px solid @ss_accent; outline-offset: -2px; }
+.sharpshot text:focus-visible, .sharpshot .canvas:focus-visible { outline: 0 solid transparent; }
+.sharpshot row:focus-visible { outline-offset: -2px; }
+
+.sharpshot label:disabled { color: @ss_dim; }
+.sharpshot label.title { font-weight: 700; }
+.sharpshot .dialog-vbox label.title { font-size: larger; }
+.sharpshot selection { background-color: @ss_selection; color: @ss_text; }
+.sharpshot placeholder { color: @ss_muted; opacity: 1; }
+.sharpshot text { caret-color: @ss_accent; -gtk-secondary-caret-color: @ss_accent; }
+
+/* Header bar and window controls */
+.sharpshot headerbar { background-color: @ss_surface; color: @ss_text; border: 0 solid @ss_border; border-bottom-width: 1px; border-radius: 0; padding: 4px 8px; min-height: 0; }
+.sharpshot headerbar .title { font-weight: 700; }
+.sharpshot windowcontrols { border-spacing: 4px; }
+.sharpshot windowcontrols button { color: @ss_text; background-color: transparent; border: 0; border-radius: 6px; margin: 0; padding: 0; min-width: 28px; min-height: 28px; }
+.sharpshot windowcontrols button > image { background: none; border-radius: 0; min-width: 16px; min-height: 16px; }
+.sharpshot windowcontrols button:hover { background-color: @ss_hover; }
+.sharpshot windowcontrols button:active, .sharpshot windowcontrols button.keyboard-activating { background-color: @ss_selected; }
+
+/* Buttons: the bordered default is the context-bar look; .tool-button below is the borderless toolbar look. */
+.sharpshot button { color: @ss_text; background-color: @ss_hover; border: 1px solid @ss_border; border-radius: 5px; min-width: 16px; min-height: 24px; padding: 4px 8px; -gtk-icon-filter: none; }
+.sharpshot button:hover { background-color: @ss_selected; }
+.sharpshot button:active, .sharpshot button:checked, .sharpshot button.keyboard-activating { background-color: @ss_selected; }
+.sharpshot button:disabled { color: @ss_dim; background-color: @ss_surface; }
+.sharpshot .dialog-action-area button { padding: 8px 14px; }
+.sharpshot .tool-button { background-color: transparent; color: @ss_text; border: 1px solid transparent; border-radius: 6px; min-width: 22px; min-height: 22px; padding: 5px; }
+.sharpshot .tool-button:hover { background-color: @ss_hover; }
+.sharpshot .tool-button:checked { color: @ss_accent; background-color: @ss_selected; border-color: @ss_accent; }
+.sharpshot .tool-button:active { background-color: @ss_selected; }
+.sharpshot .tool-button:disabled { color: @ss_dim; }
+.sharpshot .export-button { color: @ss_accent; background-color: @ss_selected; }
+.sharpshot menubutton.tool-button { padding: 0; }
+.sharpshot menubutton.tool-button > button { background-color: transparent; border: 0; padding: 6px; }
+.sharpshot .swatch { min-width: 20px; min-height: 20px; padding: 5px; }
+.sharpshot .size-preset { min-width: 20px; font-size: 12px; font-weight: 600; }
+.sharpshot colorbutton button { padding: 4px; min-width: 24px; min-height: 24px; border-radius: 5px; }
+.sharpshot colorswatch > overlay { border: 1px solid @ss_border; }
+
+/* Layout bars */
+.sharpshot .canvas { background-color: @ss_canvas; }
+.sharpshot .canvas.annotation-overlay { background-color: transparent; }
+.sharpshot .style-bar { background-color: @ss_surface; border-top: 1px solid @ss_border; padding: 7px 12px; }
+.sharpshot .status-bar { color: @ss_muted; padding: 4px 12px 7px; font-size: 12px; }
+.sharpshot .context-bar { background-color: @ss_surface; padding: 6px 12px; border-top: 1px solid @ss_border; }
+.sharpshot separator { background-color: @ss_border; min-width: 1px; min-height: 1px; margin: 5px 8px; }
+.sharpshot .dimension-label, .sharpshot .field-label { color: @ss_muted; font-size: 12px; }
+.sharpshot .help-popover { padding: 12px; }
+.sharpshot .context-menu-item { padding: 7px 10px; min-height: 22px; }
+.sharpshot .context-menu-status { padding: 3px 2px; }
+
+/* Text input */
+.sharpshot entry { color: @ss_text; background-color: @ss_surface; border: 1px solid @ss_border; border-radius: 5px; min-height: 32px; padding: 0 8px; }
+.sharpshot spinbutton { color: @ss_text; background-color: @ss_surface; border: 1px solid @ss_border; border-radius: 5px; min-width: 80px; min-height: 32px; padding: 0; border-spacing: 0; }
+.sharpshot spinbutton > text { min-width: 28px; margin: 0; padding: 6px; }
+.sharpshot spinbutton > button { color: @ss_text; background-color: transparent; border: 0 solid @ss_border; border-left-width: 1px; border-radius: 0; margin: 0; min-height: 16px; padding: 0 8px; }
+.sharpshot spinbutton > button:dir(ltr):last-child { border-radius: 0 4px 4px 0; }
+.sharpshot spinbutton > button:hover { background-color: @ss_selected; }
+.sharpshot spinbutton > button:active { background-color: @ss_selected; }
+.sharpshot spinbutton > button:disabled { color: @ss_dim; background-color: transparent; }
+.sharpshot entry:disabled, .sharpshot spinbutton:disabled { color: @ss_dim; background-color: @ss_surface; }
+.sharpshot textview, .sharpshot textview text { background-color: @ss_canvas; color: @ss_text; }
+
+/* Check button */
+.sharpshot check { color: @ss_text; background-color: @ss_surface; border: 1px solid @ss_dim; border-radius: 3px; min-width: 14px; min-height: 14px; }
+.sharpshot check:hover { border-color: @ss_accent; }
+.sharpshot check:checked, .sharpshot check:indeterminate { color: @ss_accent; background-color: @ss_selected; border-color: @ss_accent; }
+.sharpshot check:disabled { color: @ss_dim; border-color: @ss_border; }
+
+/* Scale: trough, filled part and thumb keep the theme's geometry so the style bar does not reflow. */
+.sharpshot scale { min-width: 10px; min-height: 10px; padding: 12px; }
+.sharpshot scale > trough { background-color: @ss_border; border: 1px solid @ss_border; border-radius: 3px; }
+.sharpshot scale > trough > fill, .sharpshot scale > trough > highlight { margin: -1px; border: 1px solid @ss_accent; border-radius: 3px; background-color: @ss_accent; }
+.sharpshot scale > trough > fill { background-color: @ss_selected; border-color: @ss_selected; }
+.sharpshot scale > trough > slider { background-color: @ss_text; border: 1px solid @ss_accent; border-radius: 100%; min-width: 18px; min-height: 18px; margin: -9px; }
+.sharpshot scale > trough > slider:hover, .sharpshot scale > trough > slider:active { background-color: @ss_accent; }
+.sharpshot scale:disabled > trough > highlight, .sharpshot scale:disabled > trough > fill { background-color: transparent; border-color: transparent; }
+.sharpshot scale:disabled > trough > slider { background-color: @ss_dim; border-color: @ss_dim; }
+
+/* Scrollbars: one geometry for overlay and classic modes; the idle overlay indicator stays thin. */
+.sharpshot scrollbar { background-color: transparent; border: 0; }
+.sharpshot scrollbar > range > trough { background-color: transparent; border: 0; }
+.sharpshot scrollbar > range > trough > slider { background-color: @ss_dim; background-clip: padding-box; border: 4px solid transparent; border-radius: 10px; min-width: 8px; min-height: 8px; margin: 0; }
+.sharpshot scrollbar > range > trough > slider:hover { background-color: @ss_muted; }
+.sharpshot scrollbar > range > trough > slider:hover:active { background-color: @ss_accent; }
+.sharpshot scrollbar > range > trough > slider:disabled { background-color: transparent; }
+.sharpshot scrollbar.horizontal > range > trough > slider { min-width: 40px; }
+.sharpshot scrollbar.vertical > range > trough > slider { min-height: 40px; }
+.sharpshot scrollbar.overlay-indicator:not(.dragging):not(.hovering) > range > trough > slider { border-width: 1px; min-width: 3px; min-height: 3px; }
+.sharpshot scrollbar.overlay-indicator:not(.dragging):not(.hovering).horizontal > range > trough > slider { min-width: 40px; }
+.sharpshot scrollbar.overlay-indicator:not(.dragging):not(.hovering).vertical > range > trough > slider { min-height: 40px; }
+.sharpshot overshoot, .sharpshot undershoot { background-image: none; }
+.sharpshot junction { background-color: @ss_surface; }
+
+/* Popovers and the dropdown list */
+.sharpshot popover.background { background-color: transparent; color: @ss_text; }
+.sharpshot popover > contents { background-color: @ss_canvas; color: @ss_text; border: 1px solid @ss_border; border-radius: 6px; padding: 8px; }
+.sharpshot popover > arrow { background-color: @ss_canvas; border: 1px solid @ss_border; }
+.sharpshot dropdown popover { margin-top: 6px; padding: 0; }
+.sharpshot dropdown popover > contents { padding: 0; }
+.sharpshot dropdown popover listview { margin: 8px; }
+.sharpshot dropdown popover listview > row { padding: 8px; border-radius: 5px; }
+.sharpshot listview, .sharpshot list { background-color: transparent; color: inherit; }
+.sharpshot row { background-color: transparent; color: inherit; }
+.sharpshot row:hover { background-color: @ss_hover; }
+.sharpshot row:selected, .sharpshot row:selected:hover { background-color: @ss_selected; color: @ss_text; }
+.sharpshot button row, .sharpshot button row:hover { background-color: transparent; }
+
+/* Tooltips live in their own surface outside the window's node tree. */
+tooltip.background { background-color: @ss_canvas; background-image: none; color: @ss_text; border: 1px solid @ss_border; border-radius: 6px; box-shadow: none; padding: 6px 10px; font-family: "Adwaita Sans", Cantarell, "Noto Sans", sans-serif; font-style: normal; font-weight: 400; text-shadow: none; }
+tooltip.background * { color: inherit; font-family: inherit; font-style: inherit; font-weight: inherit; background-color: transparent; background-image: none; border: 0; box-shadow: none; text-shadow: none; }
+
+/* Text is painted by the scene renderer; the overlay provides native caret and selection. */
+.sharpshot textview.canvas-caption, .sharpshot textview.canvas-caption text { background: transparent; color: transparent; border: 1px solid @ss_accent; border-radius: 0; padding: 0; margin: 0; }
+.sharpshot textview.canvas-caption text { border: 0; }
+.sharpshot textview.canvas-caption selection { background: alpha(@ss_accent,0.25); color: transparent; }
+.sharpshot .inspector { background-color: @ss_surface; border-left: 1px solid @ss_border; }
+
+/* Designer: tabs, toggle cards for looks and canvas formats. The preview is the only decorative surface. */
+.sharpshot notebook.designer-tabs > header { background-color: @ss_surface; border-bottom: 1px solid @ss_border; padding: 0 8px; }
+.sharpshot notebook.designer-tabs > header > tabs > tab { color: @ss_muted; padding: 9px 14px; border-bottom: 2px solid transparent; }
+.sharpshot notebook.designer-tabs > header > tabs > tab:hover { color: @ss_text; background-color: @ss_hover; }
+.sharpshot notebook.designer-tabs > header > tabs > tab:checked { color: @ss_accent; border-bottom-color: @ss_accent; font-weight: 700; }
+.sharpshot .look-card { background-color: @ss_canvas; border: 2px solid @ss_border; border-radius: 8px; padding: 5px; }
+.sharpshot .look-card:hover { background-color: @ss_hover; }
+.sharpshot .look-card:checked { background-color: @ss_selected; border-color: @ss_accent; }
+.sharpshot .card-name { font-size: 12px; font-weight: 600; }
+.sharpshot .look-card:checked .card-name { color: @ss_accent; }

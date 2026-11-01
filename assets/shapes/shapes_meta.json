@@ -1,0 +1,91 @@
+{
+  "classes": [
+    "none",
+    "line",
+    "arrow",
+    "rectangle",
+    "ellipse",
+    "triangle",
+    "diamond",
+    "pentagon",
+    "hexagon",
+    "star",
+    "heart",
+    "cloud",
+    "scribble"
+  ],
+  "reject_classes": [
+    "none"
+  ],
+  "n_points": 128,
+  "input": {
+    "name": "points",
+    "shape": [
+      1,
+      128,
+      2
+    ],
+    "contract": "model_input: arc-length resampling of the raw stroke to n_points (first and last kept), then bounding-box centre to the origin and the longer side scaled to 1"
+  },
+  "outputs": {
+    "probs": [
+      1,
+      13
+    ],
+    "head": [
+      1,
+      128
+    ]
+  },
+  "gates": {
+    "line": {
+      "conf": 0.8,
+      "resid": 0.03073698516287527
+    },
+    "arrow": {
+      "conf": 0.7,
+      "resid": 0.029916597631421685
+    },
+    "rectangle": {
+      "conf": 0.8,
+      "resid": 0.07875680829256096
+    },
+    "ellipse": {
+      "conf": 0.6,
+      "resid": 0.07420219520237664
+    },
+    "triangle": {
+      "conf": 0.6,
+      "resid": 0.044937227052583746
+    },
+    "diamond": {
+      "conf": 0.5,
+      "resid": 0.016355542949305905
+    },
+    "pentagon": {
+      "conf": 0.5,
+      "resid": 0.016009649370884158
+    },
+    "hexagon": {
+      "conf": 0.4
+    },
+    "star": {
+      "conf": 0.8,
+      "resid": 0.1431955102850509
+    },
+    "heart": {
+      "conf": 0.5,
+      "resid": 0.0904250395357044
+    },
+    "cloud": {
+      "conf": 0.4,
+      "resid": 0.0887236231887973
+    },
+    "scribble": {
+      "conf": 0.9
+    }
+  },
+  "fit": {
+    "straight_tolerance": 0.06
+  }
+}

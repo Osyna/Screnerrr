@@ -1,0 +1,42 @@
+[package]
+name = "sharpshot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Native Wayland screenshot annotation with on-device smart shapes"
+license-file = "LICENSING.md"
+repository = "https://github.com/Osyna/Screnerrr"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+cairo-rs = { version = "0.21", features = ["svg", "pdf", "png", "v1_16"] }
+clap = { version = "4", features = ["derive"] }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_8"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+memmap2 = "0.9"
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "api-31", "download-binaries", "tls-native"] }
+pangocairo = "0.21"
+rustix = { version = "1", features = ["event"] }
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: project files must reload colours and geometry bit-exactly.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+litert = "=0.2.1"
+litert-sys = "=0.2.1"
+libloading = "0.8"
+tempfile = "3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[dev-dependencies]
+flate2 = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+debug = 0

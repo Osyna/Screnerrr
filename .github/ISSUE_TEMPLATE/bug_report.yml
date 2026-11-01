@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible SharpShot problem
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Include the expected and observed result. Use a synthetic screenshot; do not upload private projects, screenshots or credentials.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Version and environment
+      description: SharpShot version, Linux distribution, compositor, display scale and installation method.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitised output or screenshots
+      description: Editable projects may contain original pixels beneath redactions. Check attachments before posting.
