@@ -21,7 +21,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends git g++ pkg-config libgtk-4-dev libssl-dev ca-certificates fonts-dejavu-core
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install formatter
         run: rustup component add rustfmt
       - name: Check formatting
