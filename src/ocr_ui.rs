@@ -276,11 +276,6 @@ impl OcrUi {
         self.toggle.is_active()
     }
 
-    /// Turns the text layer on or off (F8); turning it on starts recognition the first time.
-    pub fn toggle(&self) {
-        self.toggle.set_active(!self.toggle.is_active());
-    }
-
     /// Selects every visible recognised glyph (Ctrl+A while the layer is on).
     pub fn select_all(&self) {
         let Some((page, vis)) = self.snapshot() else {

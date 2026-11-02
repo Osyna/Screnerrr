@@ -7,7 +7,10 @@
 use crate::{
     chrome::{self, Icon},
     designer::{caption, named},
-    document::{MAX_FONT, MAX_HEAD_SIZE, MAX_WIDTH, TextStyle},
+    document::{
+        DEFAULT_FAMILY, DEFAULT_FONT_STYLE, MAX_FONT, MAX_HEAD_SIZE, MAX_RADIUS, MAX_WIDTH,
+        MIN_WIDTH, TextEffect, TextStyle, valid_family, valid_font_style,
+    },
     interaction::State,
     presentation::Presentation,
 };
@@ -120,8 +123,52 @@ pub struct Preset {
     pub text_size: f64,
     #[serde(default)]
     pub text_style: TextStyle,
+    /// Shape and font defaults. Absent in presets saved before they existed, and left out of the
+    /// file while they are the original look, so an untouched preset stays readable by older builds.
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub fill: bool,
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub round_caps: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub corner_radius: f64,
+    #[serde(default = "sans", skip_serializing_if = "is_sans")]
+    pub font_family: String,
+    #[serde(default = "regular", skip_serializing_if = "is_regular")]
+    pub font_style: String,
+    #[serde(default, skip_serializing_if = "is_plain")]
+    pub text_effect: TextEffect,
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub step_ring: bool,
     /// Frame style only: fixed canvas and output sizes belong to one screenshot, never to a preset.
     pub presentation: Presentation,
+}
+
+fn on() -> bool {
+    true
+}
+fn is_on(v: &bool) -> bool {
+    *v
+}
+fn is_off(v: &bool) -> bool {
+    !*v
+}
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+fn sans() -> String {
+    DEFAULT_FAMILY.to_owned()
+}
+fn is_sans(v: &String) -> bool {
+    v == DEFAULT_FAMILY
+}
+fn regular() -> String {
+    DEFAULT_FONT_STYLE.to_owned()
+}
+fn is_regular(v: &String) -> bool {
+    v == DEFAULT_FONT_STYLE
+}
+fn is_plain(v: &TextEffect) -> bool {
+    *v == TextEffect::None
 }
 
 impl Preset {
@@ -134,6 +181,13 @@ impl Preset {
             head_size: state.head_size,
             text_size: state.text_size,
             text_style: state.text_style,
+            fill: state.fill,
+            round_caps: state.round_caps,
+            corner_radius: state.corner_radius,
+            font_family: state.font_family.clone(),
+            font_style: state.font_style.clone(),
+            text_effect: state.text_effect,
+            step_ring: state.step_ring,
             presentation: Presentation {
                 canvas_size: None,
                 output_size: None,
@@ -155,10 +209,18 @@ impl Preset {
             self.name
         );
         ensure!(
-            (1.0..=MAX_WIDTH).contains(&self.width)
+            (MIN_WIDTH..=MAX_WIDTH).contains(&self.width)
                 && (0.0..=MAX_HEAD_SIZE).contains(&self.head_size)
                 && (1.0..=MAX_FONT).contains(&self.text_size),
             "Preset “{}” has a width or size out of range",
+            self.name
+        );
+        ensure!(
+            self.corner_radius.is_finite()
+                && (0.0..=MAX_RADIUS).contains(&self.corner_radius)
+                && valid_family(&self.font_family)
+                && valid_font_style(&self.font_style),
+            "Preset “{}” has a corner radius or font out of range",
             self.name
         );
         self.presentation
@@ -190,6 +252,13 @@ impl Preset {
             state.head_size = self.head_size;
             state.text_size = self.text_size;
             state.text_style = self.text_style;
+            state.fill = self.fill;
+            state.round_caps = self.round_caps;
+            state.corner_radius = self.corner_radius;
+            state.font_family.clone_from(&self.font_family);
+            state.font_style.clone_from(&self.font_style);
+            state.text_effect = self.text_effect;
+            state.step_ring = self.step_ring;
         }
         Ok(())
     }
@@ -968,6 +1037,104 @@ mod tests {
             state.doc.presentation,
             Presentation::default(),
             "defaults only"
+        );
+    }
+
+    #[test]
+    fn shape_font_and_effect_defaults_roundtrip_and_old_presets_load_unchanged() {
+        let file = |p: Preset| PresetFile {
+            version: VERSION,
+            presets: vec![p],
+        };
+        // The original look writes none of the new keys, so older builds keep reading the file.
+        let plain = serde_json::to_string(&file(preset("Plain"))).unwrap();
+        for key in [
+            "fill",
+            "round_caps",
+            "corner_radius",
+            "font_family",
+            "font_style",
+            "text_effect",
+            "step_ring",
+        ] {
+            assert!(!plain.contains(&format!("\"{key}\"")), "{key}");
+        }
+        let old = PresetFile::parse(plain.as_bytes()).unwrap();
+        let p = &old.presets[0];
+        assert!(!p.fill && p.round_caps && p.corner_radius == 0.0);
+        assert_eq!(
+            (p.font_family.as_str(), p.text_effect, p.step_ring),
+            ("Sans", TextEffect::None, false)
+        );
+        assert_eq!(p.font_style, "Regular");
+        assert_eq!(
+            (p.font_family.as_str(), p.text_effect, p.step_ring),
+            ("Sans", TextEffect::None, false)
+        );
+
+        let mut state = state();
+        state.fill = true;
+        state.round_caps = false;
+        state.corner_radius = 9.5;
+        state.font_family = "Serif, Sans".into();
+        state.font_style = "Heavy".into();
+        state.text_effect = TextEffect::Shadow;
+        state.step_ring = true;
+        let styled = Preset::from_parts("Styled", &state, Presentation::default()).unwrap();
+        let back = PresetFile::parse(&serde_json::to_vec(&file(styled.clone())).unwrap()).unwrap();
+        assert_eq!(back.presets[0], styled);
+
+        let mut fresh = self::state();
+        styled.apply(&mut fresh, true, false).unwrap();
+        assert!(fresh.fill && !fresh.round_caps && fresh.corner_radius == 9.5 && fresh.step_ring);
+        assert_eq!(
+            (
+                fresh.font_family.as_str(),
+                fresh.font_style.as_str(),
+                fresh.text_effect
+            ),
+            ("Serif, Sans", "Heavy", TextEffect::Shadow)
+        );
+
+        for bad in [
+            Preset {
+                corner_radius: -1.0,
+                ..styled.clone()
+            },
+            Preset {
+                corner_radius: f64::NAN,
+                ..styled.clone()
+            },
+            Preset {
+                font_family: "a\nb".into(),
+                ..styled.clone()
+            },
+            Preset {
+                font_family: " ".into(),
+                ..styled.clone()
+            },
+            Preset {
+                font_style: "".into(),
+                ..styled.clone()
+            },
+            Preset {
+                font_style: "Hea\nvy".into(),
+                ..styled.clone()
+            },
+            Preset {
+                width: 0.05,
+                ..styled.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        assert!(
+            Preset {
+                width: 0.1,
+                ..styled
+            }
+            .validate()
+            .is_ok()
         );
     }
 }

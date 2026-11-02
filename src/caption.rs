@@ -1,6 +1,6 @@
 use crate::{
     chrome::{self, Icon},
-    document::{Mark, TextAlign, TextStyle},
+    document::{Mark, TextAlign, TextEffect, TextStyle, font_description, installed_families},
     interaction::{State, TextDraft, Transform},
 };
 use gtk::{gdk, glib, prelude::*};
@@ -21,6 +21,9 @@ pub struct Caption {
     bold: gtk::ToggleButton,
     italic: gtk::ToggleButton,
     alignment: gtk::DropDown,
+    family: gtk::DropDown,
+    families: Vec<String>,
+    effect: gtk::DropDown,
     error: gtk::Label,
     tag: gtk::TextTag,
     state: Rc<RefCell<State>>,
@@ -29,7 +32,7 @@ pub struct Caption {
     active: Cell<bool>,
     preview: RefCell<Option<Mark>>,
     revision: Cell<u64>,
-    metrics: Cell<(f64, bool, bool)>,
+    metrics: RefCell<(f64, bool, bool, String, String)>,
     placement: Cell<(f64, f64, f64)>,
     text_scale: Cell<f64>,
 }
@@ -74,6 +77,15 @@ impl Caption {
         let alignment = gtk::DropDown::from_strings(&["Left", "Centre", "Right"]);
         alignment.update_property(&[gtk::accessible::Property::Label("Caption alignment")]);
         toolbar.append(&alignment);
+        let (family, families) = family_picker(
+            "Caption font family",
+            "Font family of this caption · type to search installed fonts",
+        );
+        toolbar.append(&family);
+        let effect = gtk::DropDown::from_strings(&TextEffect::ALL.map(TextEffect::label));
+        effect.set_tooltip_text(Some("Caption effect · Alt cycles outline and shadow"));
+        effect.update_property(&[gtk::accessible::Property::Label("Caption effect")]);
+        toolbar.append(&effect);
         let background = gtk::CheckButton::with_label("Readable background");
         toolbar.append(&background);
         let apply = chrome::button(
@@ -120,6 +132,9 @@ impl Caption {
             bold,
             italic,
             alignment,
+            family,
+            families,
+            effect,
             error,
             tag,
             state,
@@ -128,7 +143,7 @@ impl Caption {
             active: Cell::new(false),
             preview: RefCell::new(None),
             revision: Cell::new(0),
-            metrics: Cell::new((0., false, false)),
+            metrics: RefCell::new((0., false, false, String::new(), String::new())),
             placement: Cell::new((f64::NAN, f64::NAN, f64::NAN)),
             text_scale: Cell::new(1.),
         });
@@ -161,6 +176,13 @@ impl Caption {
             this,
             move |_| this.update()
         ));
+        for picker in [&this.family, &this.effect] {
+            picker.connect_selected_notify(glib::clone!(
+                #[weak]
+                this,
+                move |_| this.update()
+            ));
+        }
         this.apply.connect_clicked(glib::clone!(
             #[weak]
             this,
@@ -223,6 +245,15 @@ impl Caption {
                 .set_cursor_from_name(Some(if panning { "grabbing" } else { "text" }));
         }
     }
+    /// Steps the open caption's effect: none, inverted outline, contrast outline, shadow, none.
+    /// Does nothing while no caption is being edited. Bound to Alt by the editor.
+    pub fn cycle_effect(&self) {
+        if self.active.get() {
+            let at = self.effect.selected() as usize % TextEffect::ALL.len();
+            self.effect
+                .set_selected(((at + 1) % TextEffect::ALL.len()) as u32);
+        }
+    }
     pub fn open(&self, draft: Option<TextDraft>, transform: Transform) {
         let Some(d) = draft else { return };
         let scale =
@@ -251,6 +282,14 @@ impl Caption {
             TextAlign::Center => 1,
             TextAlign::Right => 2,
         });
+        self.family
+            .set_selected(family_position(&self.families, &d.font_family));
+        self.effect.set_selected(
+            TextEffect::ALL
+                .iter()
+                .position(|e| *e == d.text_effect)
+                .unwrap_or(0) as u32,
+        );
         self.input.buffer().set_text(&d.value);
         let buffer = self.input.buffer();
         buffer.apply_tag(&self.tag, &buffer.start_iter(), &buffer.end_iter());
@@ -295,6 +334,21 @@ impl Caption {
     pub fn needs_sync(&self, transform: Transform) -> bool {
         self.active.get() && self.placement.get() != (transform.x, transform.y, transform.scale)
     }
+    /// Rebuilds the live preview and the input's position from `state`'s open draft, for changes
+    /// made to the draft outside the toolbar (keyboard nudges via `State::move_text_draft`).
+    /// `state` is the caller's own borrow of the shared state. Does nothing while no caption is
+    /// being edited; the unchanged-draft path of `sync` stays cached.
+    pub fn refresh_draft(&self, state: &State) {
+        if !self.active.get() {
+            return;
+        }
+        *self.preview.borrow_mut() = state.draft_mark();
+        self.revision.set(state.doc.revision());
+        if let Some(d) = &state.text_draft {
+            self.position(d, state.transform);
+        }
+        self.area.queue_draw();
+    }
     pub fn sync(&self, state: &State) {
         if state.text_draft.is_none() {
             if self.active.get() {
@@ -331,23 +385,23 @@ impl Caption {
     }
     fn position(&self, draft: &TextDraft, t: Transform) {
         let size = (draft.font_size * t.scale).clamp(1., 32767.);
-        let metrics = (size, draft.text_style.bold, draft.text_style.italic);
+        let metrics = (
+            size,
+            draft.text_style.bold,
+            draft.text_style.italic,
+            draft.font_family.clone(),
+            draft.font_style.clone(),
+        );
         self.updating.set(true);
-        if self.metrics.get() != metrics {
-            let mut font = gtk::pango::FontDescription::from_string("Sans");
-            font.set_absolute_size(size * f64::from(gtk::pango::SCALE));
-            font.set_weight(if metrics.1 {
-                gtk::pango::Weight::Bold
-            } else {
-                gtk::pango::Weight::Normal
-            });
-            font.set_style(if metrics.2 {
-                gtk::pango::Style::Italic
-            } else {
-                gtk::pango::Style::Normal
-            });
+        if *self.metrics.borrow() != metrics {
+            let font = font_description(
+                &draft.font_family,
+                &draft.font_style,
+                size,
+                draft.text_style,
+            );
             self.tag.set_property("font-desc", &font);
-            self.metrics.set(metrics);
+            *self.metrics.borrow_mut() = metrics;
         }
         self.input.set_justification(match draft.text_style.align {
             TextAlign::Left => gtk::Justification::Left,
@@ -424,6 +478,12 @@ impl Caption {
             d.font_size = self.font.value();
             d.box_width = box_width;
             d.background = self.background.is_active();
+            if let Some(f) = self.families.get(self.family.selected() as usize) {
+                d.font_family.clone_from(f);
+            }
+            if let Some(e) = TextEffect::ALL.get(self.effect.selected() as usize) {
+                d.text_effect = *e;
+            }
             d.text_style = TextStyle {
                 bold: self.bold.is_active(),
                 italic: self.italic.is_active(),
@@ -453,6 +513,31 @@ impl Caption {
         (self.changed)();
         self.area.grab_focus();
     }
+}
+
+/// A searchable list of the installed font families; entry `i` of the dropdown is `families[i]`.
+pub fn family_picker(label: &str, tip: &str) -> (gtk::DropDown, Vec<String>) {
+    use gtk::glib::prelude::StaticType;
+    let families = installed_families();
+    let names: Vec<&str> = families.iter().map(String::as_str).collect();
+    let picker = gtk::DropDown::from_strings(&names);
+    picker.set_expression(Some(gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
+    )));
+    picker.set_enable_search(true);
+    picker.set_tooltip_text(Some(tip));
+    picker.update_property(&[gtk::accessible::Property::Label(label)]);
+    (picker, families)
+}
+
+/// Dropdown position of a stored family; none for a fallback list or a name that is not installed.
+pub fn family_position(families: &[String], family: &str) -> u32 {
+    families
+        .iter()
+        .position(|f| f == family.trim())
+        .map_or(gtk::INVALID_LIST_POSITION, |i| i as u32)
 }
 
 // Controls use image pixels; a resized caption stores its wrap width in local units.

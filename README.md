@@ -1,77 +1,80 @@
 # SharpShot
 
-A native Wayland screenshot and annotation app written in Rust. The repository is `Osyna/Screnerrr`; the application and executable are named `sharpshot`.
+A native Rust screenshot editor for Linux: capture a Wayland desktop, annotate it, select text with local OCR, and prepare a framed image to share. The repository is `Osyna/Screnerrr`; the application and executable are named `sharpshot`.
 
 [![Release](https://img.shields.io/github/v/release/Osyna/Screnerrr)](https://github.com/Osyna/Screnerrr/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/Osyna/Screnerrr/ci.yml?branch=main&label=CI)](https://github.com/Osyna/Screnerrr/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20%2B%20source--available-blue)](LICENSING.md)
 
-![SharpShot editor with arrows, shapes and an editable caption](assets/screenshots/editor.png)
+![Recorded SharpShot workflow: fitted shapes, resizable numbered marker, styled captions, highlighters, OCR redaction, navigation and Designer](assets/screenshots/sharpshot-expanded.gif)
 
-The demo images use synthetic content.
+The 50-second recording uses the real GTK editor. The demo and screenshots use synthetic content.
 
 ## Features
 
-- Edit arrows, lines, shapes, numbered circles and captions as separate objects. Group them, change their stacking order and undo edits.
-- Select recognised text with local PaddleOCR. Copy words, lines or multiline selections, then add highlights, underlines or strike-through marks.
-- Cover sensitive areas with opaque redaction or a source-independent pixelated privacy zone. OCR menus can mask selected text directly.
-- Crop and resize screenshots, then add backgrounds, spacing, rounded corners, borders and shadows in Designer.
-- Zoom around the cursor and pan with the middle mouse button. Right-click for actions relevant to the selected object or current mode.
-- Copy or export the rendered image, and save an editable `.sharp` project to continue later.
+- Sketch a smart shape, choose a correction or keep the original stroke. Manual arrows, lines, rectangles, ellipses and hold-to-size numbered markers remain editable.
+- Select, group, move, resize and rotate objects. Change their stacking order, fill, rounded corners, line caps, decimal stroke widths and arrow-tip sizes, with undo for whole edits.
+- Type on the image with native text editing, font families and faces, bold/italic, alignment, wrapping and outline/shadow effects. Resizing keeps glyph proportions.
+- Select recognised words or multiline text with on-device PaddleOCR. Copy formatted text or use context menus for highlighting, underlining, strike-through and direct redaction.
+- Draw block and freehand highlighters. Protect sensitive areas with opaque redaction or a source-independent pixelated privacy zone; spotlight and magnifier tools call attention to details.
+- Crop and resize, then use Designer looks, gradients, spacing, rounded or square corners, borders and shadows. Save frames for product screenshots and social posts.
+- Zoom around the cursor, pan with the middle mouse button or touchpad, and search the command palette. Right-click menus follow the selected object or current mode.
+- Copy PNGs, export privacy-safe SVG/PDF, retain private editable projects and recovery copies, pin references, or capture a scrolling page. JSON configuration adds palettes, shortcuts, stdin input and automated copy/save workflows.
 
 ![OCR selection and its context menu](assets/screenshots/ocr-context.png)
 
 ## Requirements
 
-- Linux x86-64 with GTK 4.8+, Cairo 1.16+ and its usual desktop runtime.
-- A compositor supporting the wlroots screencopy protocol for desktop capture, such as Hyprland. GNOME/KDE capture portals are not implemented.
-- `slurp` for interactive region selection. Editing an existing image does not need desktop capture.
-- Building additionally needs Rust 1.92 or later, Cargo, pkg-config and a C/C++ toolchain.
+- Linux x86-64 with GTK 4.8+, Cairo 1.16+ and the usual desktop runtime. Existing images can be edited under Wayland or X11.
+- Desktop capture needs a compositor exposing the wlroots screencopy protocol, such as Hyprland. GNOME/KDE capture portals are not implemented.
+- `slurp` is required for interactive region selection, not for editing an existing image or giving capture coordinates.
+- Building needs Rust 1.92+, Cargo, pkg-config and a C/C++ toolchain.
 
-The release build needs glibc 2.39+ and libstdc++ providing `GLIBCXX_3.4.31` or later. The native OCR runtime rules out older environments: Debian 13 works, Debian 12 does not.
+The downloadable build needs glibc 2.39+ and libstdc++ providing `GLIBCXX_3.4.31` or later. Debian 13 works; Debian 12's native libraries are too old for the bundled inference runtime. Fonts come from your system. Install the families you want to use, including an emoji font if needed.
 
 ## Install
 
 ### Download a build
 
-The [latest release](https://github.com/Osyna/Screnerrr/releases/latest) has a Linux x86-64 archive with the executable, its two native libraries and the license notices. Download it with `SHA256SUMS` into the same directory:
+Download the Linux x86-64 archive and `SHA256SUMS` from the [latest release](https://github.com/Osyna/Screnerrr/releases/latest), into the same directory:
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf sharpshot-v0.1.0-linux-x86_64.tar.gz
-cd sharpshot-v0.1.0-linux-x86_64
+tar -xzf sharpshot-v0.2.0-linux-x86_64.tar.gz
+cd sharpshot-v0.2.0-linux-x86_64
 ./sharpshot --version
+./sharpshot --help
 ```
 
-Keep `libLiteRt.so` and `libgtk4-layer-shell.so.0` beside the executable; it finds them relative to its own path. To run it from anywhere, add that directory to `PATH` instead of copying the executable alone. The archive is not code-signed.
+Keep `libLiteRt.so` and `libgtk4-layer-shell.so.0` beside the executable. Add that directory to `PATH` if desired; copying the executable alone loses those libraries. The archive is not code-signed.
 
 Runtime packages on Arch Linux:
 
 ```sh
-sudo pacman -S --needed gtk4 gcc-libs slurp
+sudo pacman -S --needed gtk4 gcc-libs slurp ttf-dejavu
 ```
 
 On Debian 13:
 
 ```sh
-sudo apt install libgtk-4-1 libstdc++6 slurp
+sudo apt install libgtk-4-1 libstdc++6 slurp fonts-dejavu-core
 ```
 
 ### Build from source
 
-Build dependencies on Arch Linux:
+On Arch Linux:
 
 ```sh
-sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp
+sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp ttf-dejavu
 ```
 
-On Debian 13, install Rust separately using [rustup](https://rustup.rs), then:
+On Debian 13, install Rust using [rustup](https://rustup.rs), then:
 
 ```sh
-sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp
+sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp fonts-dejavu-core
 ```
 
-Then build and check the executable:
+Build and check the executable:
 
 ```sh
 git clone https://github.com/Osyna/Screnerrr.git
@@ -81,103 +84,186 @@ cargo build --release --locked
 ./target/release/sharpshot --help
 ```
 
-The first build downloads native inference runtimes. Shapes and OCR model files are in the source tree and bundled into the executable; keep them when cloning or packaging. For installation outside the build tree and native-library redistribution, follow the [build instructions in the manual](MANUAL.md#build). Wayland reference pins additionally need GTK4 layer-shell. Binary distributions must include the relevant native libraries and [third-party notices](LICENSING.md).
+The first build downloads native inference runtimes. Shape and OCR models are in the source tree and embedded in the executable. For installation outside the build tree, follow the [manual's build instructions](MANUAL.md#build), including native libraries and [third-party notices](LICENSING.md). Wayland reference pins also need GTK4 layer-shell.
 
 ## Usage
 
-Capture a monitor and open the editor:
+Capture a monitor, a selected region or explicit desktop coordinates:
 
 ```sh
 sharpshot
-sharpshot --list-outputs      # monitor names for --output
+sharpshot --list-outputs
 sharpshot --output DP-1
-```
-
-Select a desktop region, or give its coordinates:
-
-```sh
 sharpshot --region
 sharpshot --geometry "100,80 640x480"
-sharpshot --cursor            # include the pointer
+sharpshot --cursor
 ```
 
-Edit an existing image or reopen a project:
+Edit an image or reopen a private project:
 
 ```sh
 sharpshot --input image.png
 sharpshot --project screenshot.sharp
+cat image.png | sharpshot --input -
 ```
 
-Capture without opening the editor, or capture a scrolling page:
+File and stdin inputs accept PNG, JPEG and WebP, with compressed-byte and decoded-size limits. Stdin input opens the normal editor; it is not a headless image-conversion command.
+
+Capture without opening the editor, or assemble a scrolling page:
 
 ```sh
 sharpshot --capture capture.png
+sharpshot --region --capture - > selected-region.png
 sharpshot --scroll --region
 ```
 
-Pinned reference images outlive their editor. Bind this to a key to hide and show them:
+With `--capture -`, stdout contains only PNG bytes and status goes to stderr. Pinned reference images outlive their editor; bind this to a key to hide and show them:
 
 ```sh
 sharpshot --toggle-pins
 ```
 
-A Hyprland binding for the usual case:
+A Hyprland launcher binding:
 
 ```ini
 bind = SUPER ALT, S, exec, sharpshot --region
 ```
 
+### Annotate and share
+
+1. Draw with `S` for smart fitting, or pick a manual tool. `G` uses the primary highlighter; `Shift+G` uses the other and Ctrl at the start of a stroke swaps them. Alt draws rectangles and ellipses from their centre; Shift constrains proportions. Hold and drag to grow a numbered circle; Alt adds its extra ring.
+2. Use `V` to select objects. An unfilled shape's interior is click-through. Handles resize and rotate; captions retain their proportions. `F` toggles fill, `K` toggles round line ends, and the thickness field and minus/plus controls adjust strokes independently of arrow tips or text size.
+3. Click with `T` to type. Set family, size, alignment and effect in the caption strip. Enter applies, Shift+Enter inserts a line break, Escape cancels, and clicking outside the editor applies and exits typing. Formatting controls remain part of the edit. Double-click a caption to edit it again.
+4. Press `F8` for the text layer. Select a word, line or multiline region, then right-click for copy and markup actions. Review recognised text before relying on it. Mask sensitive content before sharing.
+5. Open Crop and resize or Designer, choose a look and adjust its frame or canvas size. Copy the result or save a PNG. Use a `.sharp` project only when you need to keep the scene editable.
+
 ### Shortcuts
 
-`?` opens the full list inside the app.
+`?` opens the full guide. These are defaults; custom bindings replace them, while focused text and numeric fields keep their editing keys.
 
 | Keys | Action |
 | --- | --- |
 | `V` `S` `P` `A` `L` `R` `E` `T` | Select, smart shape, freehand, arrow, line, rectangle, ellipse, text |
 | `C` `B` `N` `M` `H` | Crop, privacy zone, numbered step, magnifier, spotlight |
+| `G` / `Shift+G` | Primary / alternate highlighter |
+| `F` / `K` | Toggle fill / round line ends |
+| `Alt+1` through `Alt+0` | Palette colours; open custom colour when that slot is absent |
 | `Ctrl+A`, Shift-click, marquee | Select all, add to or drag a selection |
 | `Ctrl+G` / `Ctrl+Shift+G` / `Ctrl+D` | Group, ungroup, duplicate |
 | `Ctrl+Home` / `Ctrl+End` | Bring to front, send to back |
-| Arrows / `Shift`+arrows | Nudge 1 px or 10 px |
+| Arrows / `Shift`+arrows | Nudge 1 px / 10 px |
+| `Ctrl+Alt`+arrows while typing | Move the draft caption; Shift multiplies the step by 10 |
+| Tap `Alt` while using Text | Cycle the caption effect |
 | Right-click, `Menu`, `Shift+F10` | Context actions for the object or mode |
 | `F8` | OCR text layer |
-| `Ctrl+C` / `Ctrl+S` | Copy image or recognised text, export PNG |
-| `Ctrl+O` / `Ctrl+Shift+S` | Open project, save editable project |
-| `Ctrl+K` / `Ctrl+I` | Command palette, object inspector |
-| Wheel, middle-drag, `0`, `1` | Zoom at cursor, pan, fit, actual pixels |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo, redo |
+| `Ctrl+C` | Copy image, or visible recognised text while OCR is enabled; a selection limits the text |
+| `Enter` outside caption editing | Run configured image actions; copy by default |
+| `Ctrl+S` / `Ctrl+Alt+S` | Save PNG / always choose a PNG filename |
+| `Ctrl+Alt+C` | Copy the last saved PNG path |
+| `Ctrl+O` / `Ctrl+Shift+S` | Open / save an editable project |
+| `Ctrl+K` / `Ctrl+I` | Command palette / object inspector |
+| Wheel, middle-drag, `0`, `1` | Cursor-centred zoom, pan, Fit, actual pixels |
+| Touchpad / Ctrl+touchpad / pinch | Pan / cursor-centred zoom / zoom |
+| `Alt`+arrows | Pan by the configured step |
+| `Ctrl+T` / `F11` / `Ctrl+Q` | Toggle toolbars / fullscreen / close screenshot |
+| `Ctrl+Shift+Delete` | Clear all annotations, including masks, in one undoable edit |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 
-Commands above use the extracted archive or an installed executable. From a build tree, run `./target/release/sharpshot` instead.
+Commands use an extracted or installed executable. From a build tree, substitute `./target/release/sharpshot`.
 
-See the [manual](MANUAL.md) for Designer, privacy masks, editable projects, pinned references, scrolling capture and compositor setup.
+## Configuration
+
+Defaults are overridden by `$XDG_CONFIG_HOME/sharpshot/config.json` (normally `~/.config/sharpshot/config.json`), then by CLI options. `--config FILE` chooses an explicit file. Unknown fields and invalid values are errors. Settings use SharpShot's JSON format; Satty TOML is not imported.
+
+See [config.example.json](config.example.json) for every saved setting. A small example:
+
+```json
+{
+  "initial_tool": "smart",
+  "font_family": "Sans",
+  "font_style": "Regular",
+  "font_fallback": ["Noto Color Emoji"],
+  "default_fill": false,
+  "corner_radius": 12,
+  "output_filename": "~/Pictures/SharpShot-%Y-%m-%d_%H-%M-%S-%f.png",
+  "on_enter": ["copy"],
+  "on_escape": [],
+  "keybinds": {"rectangle": "u", "toolbar": "F6"}
+}
+```
+
+This changes Rectangle to `U` and toolbar visibility to `F6`; their default bindings no longer run those commands. The font fallback must be installed locally. Annotation style presets and Designer frames stay in their separate preset file.
+
+Palettes accept `#RRGGBB` or `#RRGGBBAA`. Six-digit colours preserve object opacity; an explicit alpha channel replaces it. Key bindings use GTK accelerator syntax such as `<Ctrl><Shift>s`. `color-1` through `color-10` can bind bare digits if you prefer them to the default Fit/actual-pixel keys.
+
+### Copy, save and exit
+
+Actions are `copy`, `save`, `save-as`, `copy-path` and `exit`, in order. They can be assigned to Enter, Escape or right-click. Caption edits and active gestures are protected first; an unexported close still requires confirmation.
+
+For Enter to save to a timestamped path and then close:
+
+```sh
+sharpshot --region \
+  --output-filename "$HOME/Pictures/Shot-%Y-%m-%d_%H-%M-%S-%f.png" \
+  --on-enter save,exit
+```
+
+Named saves create missing parent directories and refuse to overwrite an existing file. Save as always opens the chooser. `copy-path` copies the last successfully saved PNG path; output `-` streams PNG to stdout and does not become a saved file path.
+
+For a Wayland copy-and-save workflow with independent clipboard ownership, install `wl-clipboard`, then:
+
+```sh
+sharpshot --region \
+  --copy-command wl-copy \
+  --output-filename "$HOME/Pictures/Shot-%Y-%m-%d_%H-%M-%S-%f.png" \
+  --save-after-copy --early-exit copy
+```
+
+`--copy-command` takes repeated argv components, not an implicit shell command. For example, use `--copy-command wl-copy --copy-command=--type --copy-command image/png`. A failed copy or save leaves the editor open with an error. Native clipboard copy also refuses an automatic exit when the clipboard cannot survive closing the editor; keep it open until pasting, use a clipboard manager, or configure a helper such as `wl-copy`.
+
+Copy helpers have a 30-second deadline. That timeout stops the direct process; multi-process wrappers must manage their children. Use `exec` for a single-command shell wrapper.
+
+`--auto-copy` debounces document edits and does not replace the clipboard just by launching the app. `--save-after-copy` follows manual image copies, not every auto-copy.
+
+### Window and appearance
+
+`--width`, `--height`, `--fullscreen`, `--fullscreen-mode`, `--floating`, `--no-window-decoration`, `--hide-toolbars` and `--focus-toggle-toolbars` control launch behaviour. Floating and all-monitor fullscreen requests depend on the compositor. SharpShot keeps its tool strip when decorations are disabled.
+
+The default view is Fit. Non-default `--zoom-factor` and `--input-scale` set initial zoom to their ratio, clamped to 10% through 400%. Mouse and touchpad navigation change the view, not exported pixels.
+
+House chrome overrides external GTK themes. An explicit `--stylesheet FILE` is an opt-in override; invalid, non-UTF8 or oversized CSS fails at launch. `--profile-startup` prints local startup timings to stderr. Notifications are disabled by default; `--disable-notifications=false` enables them, with `--notification-thumbnail` for the rendered image.
 
 ## Privacy
 
-A flattened export and an editable project are different deliverables. An editable `.sharp` project can retain original screenshot pixels underneath redactions. Do not share it as a sanitised image. Inspect flattened exports before sharing; OCR can miss or misread text, and surrounding context can reveal information outside a mask.
+A privacy zone paints opaque replacement pixels. Its mosaic does not average or sample covered source pixels. Surrounding context, mask placement and material outside the zone can still reveal information; inspect the whole flattened export before sharing. OCR can miss or misread content.
 
-Use synthetic input for bug reports. Follow [SECURITY.md](SECURITY.md) for vulnerabilities.
+A `.sharp` project and a recovery copy retain the original screenshot, including pixels underneath redactions. Keep them private. Share rendered PNG, SVG or PDF instead. Version 0.2 writes project format 5 and reads formats 1 through 4; older executables reject the new format.
+
+Screen capture, OCR and rendering run locally. Runtime models are embedded; no cloud OCR account is required. An external copy command is a program you choose and may have its own behaviour.
+
+Use synthetic input for reports. See [SECURITY.md](SECURITY.md) for vulnerabilities and the [manual](MANUAL.md) for mask coverage, vector-export rules, recovery storage and compositor setup.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). For development checks:
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md). Development checks:
 
 ```sh
 cargo fmt --check
 cargo test --locked
 ```
 
-Changes to capture, clipboard or the editor also need a real or isolated desktop smoke check.
+Capture, clipboard and input changes also need a real or isolated desktop smoke check. The manual records the [verification scope](MANUAL.md#verification) and the limits of the headless setup.
 
 ## Credits
 
-[Satty](https://github.com/Satty-org/Satty) by gabm is the direct inspiration for SharpShot, and its interface informed this one: a small single-purpose tool for wlroots compositors, a compact tool strip over the screenshot, one keystroke per tool, and annotation that stays out of the way of the image. Satty is MPL-2.0 and worth using in its own right. SharpShot is a separate implementation rather than a fork; the components it does derive from other projects are listed in [LICENSING.md](LICENSING.md), and Satty is not among them.
+[Satty](https://github.com/Satty-org/Satty) is the main inspiration for SharpShot's interface and design: a screenshot-centred window, a compact icon tool strip, keyboard tool selection and annotations that stay editable. The added drawing and workflow controls follow the capabilities documented in [Satty v0.22.0](https://github.com/Satty-org/Satty/releases/tag/v0.22.0). Satty is MPL-2.0; thanks to its authors and contributors for the design and workflow inspiration.
 
-Satty itself credits [Swappy](https://github.com/jtheoof/swappy) and [Flameshot](https://flameshot.org/), which shaped this class of tool.
+Satty also credits [Swappy](https://github.com/jtheoof/swappy) and [Flameshot](https://flameshot.org/). Licenses for components distributed here are listed separately in [LICENSING.md](LICENSING.md).
 
 ## License
 
 Original SharpShot code is copyright (c) 2026 Osyna under the [MIT License](LICENSE), with the exceptions in [LICENSING.md](LICENSING.md).
 
-**Powered by [Desert Ant Labs](https://desertant.com).** The bundled Shapes model and reference-derived recognition code retain the [Desert Ant Labs Source-Available License 1.0](assets/shapes/LICENSE.md), including its usage and redistribution restrictions. They are not MIT-licensed or OSI open source.
+Powered by [Desert Ant Labs](https://desertant.com). The bundled Shapes model and reference-derived recognition code retain the [Desert Ant Labs Source-Available License 1.0](assets/shapes/LICENSE.md), including its usage and redistribution restrictions. They are not MIT-licensed or OSI open source.
 
-PaddleOCR, RapidOCR, ONNX Runtime and native libraries retain their own licenses. Preserve the accompanying notices when redistributing source or binaries. See [model provenance](assets/shapes/PROVENANCE.md), [OCR provenance](assets/ocr/PROVENANCE.md) and [native runtime notices](assets/runtime/NOTICE.md).
+PaddleOCR, RapidOCR, ONNX Runtime and native libraries retain their own licenses. Preserve the accompanying notices when redistributing source or binaries. See [shape model provenance](assets/shapes/PROVENANCE.md), [OCR provenance](assets/ocr/PROVENANCE.md) and [native runtime notices](assets/runtime/NOTICE.md).

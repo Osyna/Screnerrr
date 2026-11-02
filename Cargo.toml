@@ -1,6 +1,6 @@
 [package]
 name = "sharpshot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Native Wayland screenshot annotation with on-device smart shapes"
@@ -18,7 +18,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 memmap2 = "0.9"
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "api-31", "download-binaries", "tls-native"] }
 pangocairo = "0.21"
-rustix = { version = "1", features = ["event"] }
+rustix = { version = "1", features = ["event", "fs"] }
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: project files must reload colours and geometry bit-exactly.
 serde_json = { version = "1", features = ["float_roundtrip"] }

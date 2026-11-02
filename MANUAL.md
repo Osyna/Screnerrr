@@ -1,6 +1,6 @@
 # SharpShot
 
-A Rust screenshot and annotation tool for Hyprland, with an offline shape helper powered by [Desert Ant Labs Shapes](https://desertant.com/models/shapes/).
+A native Rust screenshot editor for Linux, with wlroots Wayland capture, local PaddleOCR and an offline shape helper powered by [Desert Ant Labs Shapes](https://desertant.com/models/shapes/).
 
 Capture a monitor or desktop region, annotate editable vector objects, and copy a PNG or save an editable project. Smart strokes fit to shapes. The inspector edits geometry and mixed selections; text edits directly on the canvas without stretched glyphs. Local PaddleOCR supplies selectable text, markup and reviewed smart redaction. Saved styles, screenshot framing, pinned reference images, scrolling capture and opt-in crash recovery are included.
 
@@ -10,10 +10,10 @@ Requires Linux, Rust 1.92+, a C toolchain, pkg-config, GTK 4.8+ and Cairo 1.16+ 
 
 ```sh
 # Arch Linux
-sudo pacman -S --needed rust base-devel gtk4 slurp
+sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp ttf-dejavu
 
 # Debian 13+: install Rust separately with rustup
-sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp
+sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp fonts-dejavu-core
 
 cargo build --release --locked
 ./target/release/sharpshot
@@ -50,8 +50,10 @@ sharpshot --region                # drag a desktop zone, then annotate; Escape c
 sharpshot --geometry "100,80 640x480" # capture explicit logical desktop coordinates
 sharpshot --cursor                # include the pointer
 sharpshot --input image.png       # annotate an existing PNG, JPEG, or WebP
+cat image.png | sharpshot --input - # PNG, JPEG or WebP through stdin
 sharpshot --capture capture.png   # save a new PNG without opening the editor
 sharpshot --region --capture zone.png # select and save without opening the editor
+sharpshot --region --capture - > zone.png # PNG-only stdout; status goes to stderr
 sharpshot --project shot.sharp    # reopen an editable project
 sharpshot --scroll --region       # guided vertical scrolling capture, then annotate
 sharpshot --scroll --geometry "100,80 640x480" # fixed scrolling-content region
@@ -102,9 +104,58 @@ hl.permission({
 The equivalent `.conf` rule is `permission = ^/usr/local/bin/sharpshot$, screencopy, allow`. Use your real installation path and escape regex metacharacters in it. Hyprland permission-rule changes require a compositor restart, not just a config reload; do not restart an active session solely to run a test.
 
 
+## Configuration and automated workflows
+
+SharpShot reads `$XDG_CONFIG_HOME/sharpshot/config.json`, normally `~/.config/sharpshot/config.json`. `--config FILE` selects an explicit file. Precedence is built-in defaults, JSON, then CLI options. Unknown fields, invalid values and files larger than 1 MiB are rejected. Configuration, stylesheet and image-file inputs must be regular files; use `--input -` for a pipe.
+
+[config.example.json](config.example.json) lists every saved setting. SharpShot uses its own JSON format, not Satty TOML. Saved annotation styles and Designer frames remain in `presets.json`; launch settings do not replace them.
+
+| Setting group | Fields and behavior |
+| --- | --- |
+| Launch | `initial_tool`, `width`, `height`, `title`, `app_id`; minimum editor size is 760 × 440 |
+| View | `zoom_factor / input_scale` sets initial zoom, clamped to 10% through 400%; default 1/1 keeps Fit |
+| Window | `fullscreen`, `fullscreen_mode` (`current-screen` or `all`), `floating`, `no_window_decoration`; the compositor decides floating and monitor-spanning behavior |
+| Toolbars | `hide_toolbars` sets initial visibility; `focus_toggle_toolbars` hides/shows on focus changes without replacing the initial choice |
+| Drawing | `default_fill`, `default_round_caps`, `corner_radius`, `annotation_size_factor`, `brush_smoothing` |
+| Fonts | `font_family`, `font_style`, `font_fallback`; Pango face keywords such as Heavy, Light, Italic or Condensed, with installed-font fallback |
+| Colours | `palette`, `custom_colors`; `#RRGGBB` preserves object opacity, `#RRGGBBAA` explicitly replaces it |
+| Actions | `on_enter`, `on_escape`, `on_right_click`, `auto_copy`, `copy_command`, `save_after_copy`, `early_exit`, `output_filename` |
+| Bindings | `keybinds` maps a supported command to a GTK accelerator, such as `rectangle: u` or `toolbar: F6` |
+| Appearance | `stylesheet` is an explicit house-style override, bounded to 256 KiB of UTF-8 CSS |
+| Notifications | `disable_notifications` defaults true; `notification_thumbnail` uses the rendered image, not the original |
+
+CLI names use hyphens, for example `--font-style`, `--brush-smoothing`, `--initial-tool` and `--no-window-decoration`. `--profile-startup` is CLI-only and prints local timings to stderr. `--help` lists options and aliases.
+
+Custom shortcuts win over defaults and disable the old binding of that command. Native editable fields keep their typing and numeric-editing keys. `color-1` through `color-10` can bind bare digits; defaults use Alt+1 through Alt+0 so 0 still means Fit and 1 means actual pixels. Palette slots beyond ten have no default digit shortcut.
+
+### Action order and clipboard lifetime
+
+Actions are `copy`, `save`, `save-as`, `copy-path` and `exit`, run in order. Enter defaults to image copy outside caption editing. Empty Escape/right-click lists retain cancellation and context menus; assigning right-click actions replaces that pointer menu, while Menu/Shift+F10 remains available. Caption edits, active gestures and unsaved closes stay protected.
+
+```sh
+sharpshot --region \
+  --output-filename "$HOME/Pictures/Shot-%Y-%m-%d_%H-%M-%S-%f.png" \
+  --on-enter save,exit
+
+sharpshot --region \
+  --copy-command wl-copy \
+  --output-filename "$HOME/Pictures/Shot-%Y-%m-%d_%H-%M-%S-%f.png" \
+  --save-after-copy --early-exit copy
+```
+
+Output paths expand leading `~/` and GLib date/time format specifiers. Named saves create missing parent directories and refuse to overwrite. Save as always opens a chooser. Output `-` streams PNG to stdout; it does not become a saved file path. `copy-path` uses the last successful PNG filename.
+
+`copy_command` is an argv array in JSON and repeated `--copy-command` components on the CLI. It receives PNG on stdin, with no implicit shell. For example, `--copy-command wl-copy --copy-command=--type --copy-command image/png` fixes the MIME type. Install the helper yourself. A failed or timed-out command leaves the editor open; stderr from arbitrary helpers is not copied into the interface. Run the configured program in a terminal to inspect its own diagnostics.
+
+The timeout stops the direct configured process, not every descendant it may spawn. Use `exec` in a single-command shell wrapper; multi-process hooks must manage their own child lifetimes. Successful clipboard daemons are deliberately allowed to outlive the editor.
+
+`auto_copy` waits for document edits and debounces them for 200 ms. Launching or moving the pointer does not replace the clipboard. `save_after_copy` follows manual image copies, not each auto-copy. `early_exit` accepts `copy`, `save` and `save-as` triggers and only follows success. Native copying refuses automatic exit if no clipboard manager can preserve the image; the editor stays open with recovery instructions. A successful external helper such as `wl-copy` owns its own clipboard data.
+
 ## Annotate
 
 The top strip contains icon tools with delayed native GTK tooltips and accessible names. Contextual actions appear below the canvas; OCR copy and markup actions appear there only while the text layer is enabled. The bottom strip holds colour, line thickness, opacity, zoom, output dimensions and crop reset. Tool and style strips scroll in narrow windows; `?` opens the shortcut guide.
+
+The shortcuts below are defaults. A configured binding replaces that command's default.
 
 | Tool or action | Shortcut | Behavior |
 | --- | --- | --- |
@@ -118,13 +169,15 @@ The top strip contains icon tools with delayed native GTK tooltips and accessibl
 | Delete selection | Delete / Backspace | Remove the selection; Undo restores layer order and attachments |
 | Smart shape | S | Draw one stroke; release to fit, then pick another shape or Keep original stroke |
 | Freehand | P | Keep the stroke exactly as drawn |
-| Attached arrow | A | Drag an arrow; ends attach to nearby objects. Tip scale in the context strip is independent of the 1–128 px line thickness |
+| Block highlighter | G by default | Drag a translucent rectangle; Ctrl at press swaps to freehand |
+| Freehand highlighter | Shift+G by default | Paint a uniform translucent stroke; Ctrl swaps to block; hold Shift for straight 15° segments |
+| Attached arrow | A | Drag an arrow; ends attach to nearby objects. Tip scale is independent of the 0.1 through 128 px line thickness |
 | Line | L | Draw a connector without an arrowhead; the same thickness control applies |
-| Rectangle | R | Drag between opposite corners |
-| Ellipse | E | Drag a bounding box |
+| Rectangle | R | Drag opposite corners; Alt centres on the press, Shift constrains a square; fill and corner radius are editable |
+| Ellipse | E | Drag a bounding box; Alt centres on the press, Shift constrains a circle |
 | Text | T | Click the image to type on it; double-click an existing caption to edit |
 | Privacy zone | B | Drag a block; select Black redaction or Pixelated privacy in the context strip |
-| Numbered step | N | Click for the default size, or hold and drag away from the centre to grow the circle; the context strip reorders numbers |
+| Numbered step | N | Click for default size or hold and drag to grow; Alt at press adds an extra ring; the context strip reorders numbers |
 | Magnifier callout | M | Drag the source region, then click to place a zoomed inset (1–8×) |
 | Spotlight | H | Drag a rounded clear zone with a white outline; dim the outside. Multiple zones remain clear together |
 | Crop | C | Drag the region to include in copy/export |
@@ -143,10 +196,15 @@ The top strip contains icon tools with delayed native GTK tooltips and accessibl
 | Actual pixels | 1 | Show at 100%; use middle-button drag or the scrollbars to pan |
 | Undo | Ctrl+Z | Undo drawing, movement, deletion, style changes, or cropping |
 | Redo | Ctrl+Shift+Z / Ctrl+Y | Restore the undone change |
+| Fill / round line ends | F / K | Change the selected compatible objects and the defaults for new ones |
+| Palette colour | Alt+1 through Alt+0 | Use a configured slot or open the custom colour chooser when that slot is absent |
+| Clear annotations | Ctrl+Shift+Delete | Remove every annotation, including privacy masks, in one undoable edit |
+| Toolbars / fullscreen / close | Ctrl+T / F11 / Ctrl+Q | Toggle chrome or fullscreen; an unsaved close is confirmed |
 | Zoom in / out | Wheel over the canvas; Ctrl+wheel; Ctrl+plus / Ctrl+minus | Zoom from 10% to 400%; wheel zoom keeps the image point under the cursor stationary, including when the image fits |
-| Pan view | Hold middle mouse / wheel button and drag | Move the view with a closed-hand cursor without editing annotations. Release returns to the current tool; Escape stops panning. Works in Fit mode without changing the image scale |
+| Smooth zoom | Ctrl+touchpad or pinch | Zoom around the pointer or gesture centre; native scrolling cannot coast the image after a consumed zoom |
+| Pan view | Middle-button drag, touchpad, Alt+arrows | Direct non-inertial panning without editing; the closed hand appears during middle-drag. Escape stops it; Alt+arrows use the configured step |
 | Copy image | Ctrl+C outside OCR mode / Copy image icon | Copy the rendered image including crop, framing and output size; the icon always copies the image |
-| Export PNG | Ctrl+S | Choose a new local PNG filename |
+| Save PNG / Save as / copy path | Ctrl+S / Ctrl+Alt+S / Ctrl+Alt+C | Save to configured output or chooser, always choose a new path, or copy the last saved path |
 | Cancel / deselect | Escape | Cancel an active gesture; otherwise clear selection and return to Select |
 | Open project | Ctrl+O | Reopen a `.sharp` project in a new window |
 | Save project | Ctrl+Shift+S | Save an editable `.sharp` project |
@@ -162,9 +220,13 @@ Attached arrows store the anchor as a fraction of the target's bounds, so they k
 
 Text has its own pixel-size field, independent of stroke width. Click with T to type directly on the image or double-click a caption to edit. The live preview includes bold, italic and paragraph alignment. Width 0 fits the text while preserving manual line breaks; a positive width wraps it. Drag a resize handle to scale uniformly, including within a group. Enter or a click outside the text editor applies the whole edit in one undo step and leaves typing mode; Shift+Enter inserts a new line. Formatting controls stay inside the edit, and Ctrl+Enter also applies from those controls. Invalid input stays open to correct. Escape cancels.
 
+Caption controls also include a searchable installed-font family picker and four effects: no effect, inverted outline, contrast outline and drop shadow. Configured Pango faces supply the initial B/I state; turning a toggle off removes that property. Tap Alt in Text mode to cycle effects; Alt chords do not cycle them. Ctrl+Alt+arrows move the uncommitted caption by `text_move` document pixels, with Shift for 10×. Apply commits position and content together; Escape leaves the original caption untouched.
+
 Magnifier callouts sample the screenshot, not the canvas, so annotations never appear twice. Redacted pixels are blacked out inside the lens as well, whatever layer the redaction sits on.
 
 Colour, opacity and thickness update the selection and set the defaults for new annotations. Privacy masks ignore colour and opacity. S/M/L correspond to 2/4/8 image pixels. Pango handles Unicode text shaping; text and numeric editing shortcuts stay with their focused fields.
+
+The thickness field has decimal steps and dedicated minus/plus buttons. Wheel or arrow-key steps are 0.1 px, Shift uses 0.01 px, Ctrl and Page Up/Down use whole pixels. Line ends can be round or flat. Rounded corners apply only to rectangles, including rotated rectangles; arbitrary polygons keep their geometry. Block and freehand highlighters accumulate alpha once per stroke so self-overlap does not darken the mark.
 
 The inspector shows mixed selection values without replacing untouched properties. Changing line width preserves each object's colour and opacity. Alignment and distribution treat groups as units; each operation is one undo step.
 
@@ -220,7 +282,7 @@ sharpshot --project shot.sharp   # reopen an editable project
 
 The format is a self-contained file: an `SHARPPRJ` header, a bounded JSON scene, and the source screenshot as PNG. Loading validates lengths, image size, ids, links, groups and transforms before a document exists, so a corrupt or hostile file is rejected instead of being half-applied. Saving refuses to overwrite and verifies that the scene it wrote parses back bit-identically.
 
-Current files use format version 4 for fixed fitted canvases. Version 3 rich-text projects and versions 1 and 2 still load; older text styles migrate as before. Older executables reject version 4 files.
+Version 0.2 writes project format 5, including fill, caps, rectangle corners, fonts, text effects, marker rings and highlighters. Formats 1 through 4 still load with their original appearance; earlier executables reject format 5 rather than dropping its styles.
 
 ### SVG and PDF
 
@@ -246,22 +308,22 @@ The preview shows the stitched image and newest seam. Repeated or changing conte
 
 ## Privacy and performance
 
-- Screen capture, inference, fitting, rendering, and clipboard handling run locally. The app makes no network requests and includes no vendor SDK telemetry.
+- Built-in capture, inference, fitting and rendering run locally without vendor telemetry. User-selected copy programs and stylesheets have their own behavior.
 - Direct shared-memory capture avoids a capture subprocess and an intermediate PNG encode/decode cycle. The read-only capture mapping is converted to pixels once; only interactive coordinate selection launches `slurp`.
-- The screenshot's Cairo surface, committed canvas commands and a viewport-sized raster are cached separately from interaction overlays. The raster uses the current display density, not a full-document bitmap enlarged with zoom. Transform and caption previews use the full painter to preserve transparency and mask ordering. There is no frame timer.
+- The screenshot's Cairo surface, committed canvas commands and a viewport-sized raster are cached separately from interaction overlays. The raster uses the current display density, not a full-document bitmap enlarged with zoom. Transform and caption previews use the full painter to preserve transparency and mask ordering. Interaction rendering has no continuous frame timer.
 - Pango logical text bounds use a thread-local cache capped at 4,096 entries and 4 MiB of text. Mark lookups validate cached ID-to-position indexes against the live scene; selection geometry reuses these lookups and text measurements.
 - OCR visibility is reused only while the recognised page, crop, image dimensions and individual privacy-mask hulls match. Mask geometry is checked before reuse; invalid geometry blocks text rather than exposing it. Gaps between separate masks remain selectable.
 - Scrolling seam previews are retained until either of the last two frames or their shift changes. Undo and recapture invalidate by frame identity, not just frame count.
 - Pixel conversion shares opaque/transparent fast paths. Rendering and framing stay in Cairo until the final RGBA conversion; resampling quality is unchanged.
 - The designer bounds its cached scene and final preview independently to a 1200 × 800 pixel budget. Export dimensions do not cause full-resolution preview allocations, and small outputs keep their native preview resolution. Preview budgets do not constrain full-resolution export.
 - The model's inference plan loads once and is reused for every stroke. Results wake GTK through an asynchronous channel; there is no result-polling timer.
-- Copy, Pin and PNG export render immutable request-time snapshots on workers, with one image operation per editor at a time. PNG encoding and file I/O also run off GTK. Delayed Copy results cannot replace a newer clipboard action. No GPU is required.
+- Copy, Pin and PNG export render immutable request-time snapshots on workers, with one image operation per editor at a time. PNG encoding and file I/O also run off GTK. Delayed native Copy results cannot replace a newer clipboard action; configured helpers control their own clipboard side effects. No GPU is required.
 
 These are implementation choices, not a benchmark claim against Satty or grim.
 
-### Measured editor changes
+### Version 0.1 optimization measurements
 
-Paired release runs used GTK 4.18.6's CPU/Cairo renderer, a 3840 × 2160 source and the same synthetic scenes. Values are medians: 30 hover callbacks, 21 annotation-drag frames and five Copy requests.
+The v0.1 optimization run used GTK 4.18.6's CPU/Cairo renderer, a 3840 × 2160 source and the same synthetic scenes. Values are medians: 30 hover callbacks, 21 annotation-drag frames and five Copy requests. These measurements do not profile the added v0.2 controls.
 
 | Operation | Before | After |
 | --- | ---: | ---: |
@@ -276,6 +338,8 @@ Copy figures measure GTK-thread blocking, not time until the image is ready. Doc
 
 SharpShot pins GTK's built-in dark base, its own palette, control styling and icon theme above external GTK themes and user CSS, including a `GTK_THEME` override. This applies to application-owned windows, popovers and dialogs. System font sizing remains available for accessibility. A portal file chooser runs in another process and keeps its system appearance.
 
+An explicit `--stylesheet FILE` is a higher-priority opt-in override. Invalid, non-UTF8, oversized or non-regular stylesheets fail instead of partially changing the appearance. Disabling window decorations retains SharpShot's tools.
+
 ## Limits
 
 - Without `--region` or `--geometry`, capture selects one output. Choose a monitor explicitly if the compositor's first output is not the one you want.
@@ -284,7 +348,7 @@ SharpShot pins GTK's built-in dark base, its own palette, control styling and ic
 - Source-derived blur/pixelation, multi-image composition and multi-page documents are not implemented.
 - Projects and recovery copies retain the original screenshot, including pixels hidden by privacy masks. Share rendered exports instead.
 - Recognition offers at most three alternative shapes, and only for strokes the model scores above its floor. Keep original stroke is always offered.
-- The clipboard is owned by the running app. Without a clipboard manager that retains images, keep SharpShot open until you paste.
+- Native clipboard ownership belongs to the running app unless a manager retains it. Keep the editor open until pasting, or configure an independent helper; automatic exit checks persistence.
 - Raster export is 8-bit PNG; SVG and PDF embed 8-bit sanitised images. HDR color management and wide-gamut preservation are not implemented.
 
 ## Verification
@@ -295,9 +359,17 @@ cargo test --locked
 
 Regression coverage includes pixel formats, stride, rotation, HiDPI geometry, annotation/crop history, recognition completing during undo, PNG rendering and overwrite protection, shape preprocessing/fitting, and the vendor's stroke fixtures. Compositor and editor smoke testing must run in a real or headless Wayland session; unit tests alone do not exercise screencopy or GTK input.
 
-Verified on x86-64 Linux: **256 regression tests passed**, including real PP-OCRv5 inference, multiline copying, dynamic privacy/crop filtering, mixed-selection editing, rich-text layout, preset persistence, recovery cancellation races, scrolling overlap detection, fitted-canvas geometry, preview memory bounds, cursor-anchored zoom and vector-export privacy. Version-1/2/3 migration and version-4 round trips are covered. Existing shape inference still runs against 51 upstream stroke fixtures.
+Version 0.2 passed 302 release-mode regressions, including configured font-face B/I removal and restoration, moved-draft atomic undo, highlighter alpha, filled/rounded hit geometry, marker rings, format-5 persistence and nonblocking FIFO rejection. Native X11 checks exercised stdin limits, CLI/config precedence, literal typing under custom shortcuts, Enter/outside-click caption application, named saves, overwrite refusal, auto-copy, external helper failures/deadlines and clipboard persistence after exit.
 
-Release GUI checks covered inspector geometry and style with undo/redo, live bold/italic captions, saved frame presets, command-palette actions, and reviewed OCR redaction with cancellation and privacy-filtered copying. A version-3 rich-text project reopened with pixel-identical PNG output. Independent librsvg and Poppler rendering matched export size and layout; decoded embedded images contained burned-in masks, while the public PDF caption remained selectable and private text was absent.
+Native Wayland checks used real virtual-pointer/keyboard protocol input on Sway at 1× and 2×. Wheel and Ctrl+smooth zoom held the cursor anchor; immediate finger lifts showed no image drift between 0.1 and 1.7 seconds after disabling GTK's separate wheel-inertia flags. Plain smooth pan moved by the exact input sum, without coasting. Middle-drag, Alt+arrows, context-menu blocking, initial scale, toolbar focus changes and regular/symlink/FIFO file inputs were exercised. Six external GTK theme names produced identical application and context-menu pixels; explicit CSS overrides and invalid CSS were also checked.
+
+Capture-to-stdout produced a complete PNG matching native Wayland frames and explicit region crops pixel-for-pixel at 1× and 2×. Save-to-stdout emitted only the expected annotated PNG, with status on stderr; invalid capture targets emitted no image bytes. The 50-second release GIF records real editor interactions through OCR redaction and Designer, and its clipboard image matched the exported PNG pixel-for-pixel.
+
+Physical pinch input was not exercised: the headless compositor has no virtual touch/pinch injector and the container has no input device. On Sway, all-monitor fullscreen requests covered only the focused output; monitor spanning remains compositor-dependent. The GUI recording uses synthetic data and real app interactions.
+
+The v0.1 baseline passed 256 regression tests, including real PP-OCRv5 inference, multiline copying, dynamic privacy/crop filtering, mixed-selection editing, rich-text layout, preset persistence, recovery cancellation races, scrolling overlap detection, fitted-canvas geometry, preview memory bounds, cursor-anchored zoom and vector-export privacy. Version-1/2/3 migration and version-4 round trips were covered. Shape inference runs against 51 upstream stroke fixtures.
+
+Version 0.1 GUI checks covered inspector geometry and style with undo/redo, live bold/italic captions, saved frame presets, command-palette actions, and reviewed OCR redaction with cancellation and privacy-filtered copying. A version-3 rich-text project reopened with pixel-identical PNG output. Independent librsvg and Poppler rendering matched export size and layout; decoded embedded images contained burned-in masks, while the public PDF caption remained selectable and private text was absent.
 
 Context-menu GUI checks exercised blank-canvas and shape menus, duplicate/group/ungroup/delete with undo, preserved multi-object selections, OCR word/line/multiline copying, selected-text highlight and direct opaque/pixelated masking with privacy-filtered copying and undo. Menu cancellation preserved an edited caption pixel-for-pixel. Keyboard opening/navigation/activation/dismissal and closing an editor with its menu open were also checked. Native Wayland at 2× confirmed popup placement, unchanged copied PNG pixels, front/back reordering, OCR word copying, opaque/pixelated mask switching and keyboard dismissal.
 

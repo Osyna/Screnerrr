@@ -43,6 +43,11 @@ pub enum Icon {
     Open,
     Ocr,
     Highlight,
+    Highlighter,
+    Fill,
+    RoundCaps,
+    Fullscreen,
+    Toolbars,
     Underline,
     Strike,
     Bold,
@@ -451,6 +456,43 @@ fn paint(kind: Icon, cr: &Context) -> Result<(), gtk::cairo::Error> {
             path(cr, &[(6., 10.), (10., 10.)]);
             path(cr, &[(17., 3.), (17., 16.), (14., 13.)]);
             path(cr, &[(17., 16.), (19., 13.)]);
+        }
+        Icon::Highlighter => {
+            path(
+                cr,
+                &[(4., 15.), (9., 7.), (15., 10.), (10., 17.), (4., 15.)],
+            );
+            path(cr, &[(9., 7.), (12., 3.), (18., 6.), (15., 10.)]);
+            path(cr, &[(2., 18.), (12., 18.)]);
+        }
+        Icon::Fill => {
+            cr.rectangle(4., 4., 12., 12.);
+            cr.stroke()?;
+            cr.rectangle(4., 10., 12., 6.);
+            cr.fill()?;
+        }
+        Icon::RoundCaps => {
+            path(cr, &[(5., 10.), (15., 10.)]);
+            cr.stroke()?;
+            for x in [5., 15.] {
+                cr.new_sub_path();
+                cr.arc(x, 10., 2.5, 0., std::f64::consts::TAU);
+            }
+        }
+        Icon::Fullscreen => {
+            for (x, y, dx, dy) in [
+                (3., 3., 1., 1.),
+                (17., 3., -1., 1.),
+                (3., 17., 1., -1.),
+                (17., 17., -1., -1.),
+            ] {
+                path(cr, &[(x, y + dy * 5.), (x, y), (x + dx * 5., y)]);
+            }
+        }
+        Icon::Toolbars => {
+            cr.rectangle(2., 3., 16., 14.);
+            path(cr, &[(2., 7.), (18., 7.)]);
+            path(cr, &[(2., 13.), (18., 13.)]);
         }
         Icon::Help => {
             cr.arc(10., 10., 8., 0., std::f64::consts::TAU);

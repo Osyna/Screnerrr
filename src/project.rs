@@ -9,9 +9,15 @@
 //! load through `migrate_v1`, which gives their arrowheads and text the sizes they were drawn at.
 //! Version 3 adds the rich text style (bold, italic, alignment) of text marks; versions 1 and 2
 //! load with plain text. Version 4 adds the presentation's fitted `canvas_size`; older files load
-//! without one, and a canvas inside a file that predates it is refused. This writer always
-//! writes version 4.
-use crate::document::{Crop, Document, Mark, TextStyle, migrate_v1};
+//! without one, and a canvas inside a file that predates it is refused. Version 5 adds the shape
+//! fill, round-caps and corner-radius styles, the per-mark font family, caption effect and step
+//! ring, the freehand highlighter kind and decimal line widths below 1 px; older files load with
+//! the look they always had, and a file that predates them but uses one is refused. This writer
+//! always writes version 5.
+use crate::document::{
+    Crop, DEFAULT_FAMILY, DEFAULT_FONT_STYLE, Document, Mark, MarkKind, TextEffect, TextStyle,
+    migrate_v1,
+};
 use crate::presentation::Presentation;
 use anyhow::{Context, Result, bail, ensure};
 use image::{ImageEncoder, ImageFormat, ImageReader, Limits, RgbaImage};
@@ -23,7 +29,7 @@ use std::{
 };
 
 const MAGIC: &[u8; 8] = b"SHARPPRJ";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const HEADER: u64 = 24;
 const MAX_META: u64 = 16 << 20;
 const MAX_PNG: u64 = 1 << 30;
@@ -99,9 +105,8 @@ impl Snapshot {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
-        let meta = file.metadata()?;
-        ensure!(meta.is_file(), "{} is not a regular file", path.display());
+        let (file, meta) = crate::open_regular_file(path)
+            .with_context(|| format!("Cannot open {}", path.display()))?;
         decode(BufReader::new(file), meta.len())
             .with_context(|| format!("Cannot load project {}", path.display()))
     }
@@ -209,6 +214,21 @@ fn decode(mut r: impl Read, len: u64) -> Result<Snapshot> {
             "Version {version} project has text styles"
         );
     }
+    ensure!(
+        version >= 5
+            || meta.marks.iter().all(|m| {
+                !m.fill
+                    && m.round_caps
+                    && m.corner_radius == 0.0
+                    && m.font_family == DEFAULT_FAMILY
+                    && m.font_style == DEFAULT_FONT_STYLE
+                    && m.text_effect == TextEffect::None
+                    && !m.step_ring
+                    && m.width >= 1.0
+                    && !matches!(m.kind, MarkKind::Highlighter)
+            }),
+        "Version {version} project has shape, cap, font, effect, thin-line or highlighter styles"
+    );
     ensure!(
         version >= 4
             || meta
@@ -425,15 +445,92 @@ mod tests {
     }
 
     #[test]
+    fn shape_cap_and_font_styles_roundtrip_and_older_files_load_unchanged() -> Result<()> {
+        let mut d = Document::new(gradient())?;
+        let (r, h, t, s) = (d.id(), d.id(), d.id(), d.id());
+        let mut rect = Mark::path(
+            r,
+            vec![p(10., 10.), p(60., 10.), p(60., 40.), p(10., 40.)],
+            true,
+            [0., 0.5, 1., 0.6],
+            3.,
+        );
+        (rect.fill, rect.corner_radius, rect.round_caps) = (true, 6.5, false);
+        d.add(rect);
+        d.add(Mark::highlighter(
+            h,
+            vec![p(5., 70.), p(40., 72.), p(80., 68.)],
+            [1., 1., 0., 0.4],
+            12.,
+        ));
+        let mut text = Mark::text(t, p(8., 50.), "Fonty", [1., 0., 0., 1.], 3.);
+        text.font_family = "DejaVu Serif, Noto Sans".into();
+        text.text_effect = TextEffect::Shadow;
+        d.add(text);
+        let mut step = Mark::step(s, p(90., 20.), 4, [1., 0., 0., 1.], 5.);
+        step.font_family = "Monospace".into();
+        step.font_style = "Heavy".into();
+        step.step_ring = true;
+        step.width = 0.5;
+        d.add(step);
+
+        let good = bytes(&Snapshot::capture(&d)?);
+        let loaded = open(&good)?;
+        assert_eq!(loaded.marks, d.marks);
+        assert_eq!(loaded.into_document()?.render()?, d.render()?);
+        // Files that predate the styles cannot name them.
+        for version in [2u32, 3, 4] {
+            let mut old = good.clone();
+            old[8..12].copy_from_slice(&version.to_le_bytes());
+            let err = open(&old).unwrap_err().to_string();
+            assert!(err.contains("highlighter styles"), "v{version}: {err}");
+        }
+
+        // A version 4 file has none of the new keys: every mark loads with the look it always had.
+        let mut plain = Document::new(gradient())?;
+        let (a, b) = (plain.id(), plain.id());
+        plain.add(Mark::path(
+            a,
+            vec![p(10., 10.), p(50., 12.)],
+            false,
+            [1., 0., 0., 1.],
+            3.,
+        ));
+        plain.add(Mark::text(b, p(8., 60.), "Plain", [1., 1., 0., 1.], 3.));
+        let (meta, png) = split(&bytes(&Snapshot::capture(&plain)?));
+        let mut v: serde_json::Value = serde_json::from_slice(&meta)?;
+        for m in v["marks"].as_array_mut().unwrap() {
+            let m = m.as_object_mut().unwrap();
+            for key in [
+                "fill",
+                "round_caps",
+                "corner_radius",
+                "font_family",
+                "font_style",
+            ] {
+                assert!(m.remove(key).is_some());
+            }
+        }
+        let mut old = Vec::new();
+        write_frame(&mut old, &serde_json::to_vec(&v)?, &png)?;
+        old[8..12].copy_from_slice(&4u32.to_le_bytes());
+        let old = open(&old)?;
+        assert_eq!(old.marks, plain.marks);
+        assert!(old.marks.iter().all(|m| m.round_caps && !m.fill));
+        assert!(old.marks.iter().all(|m| m.font_family == DEFAULT_FAMILY));
+        Ok(())
+    }
+
+    #[test]
     fn rejects_bad_magic_and_unknown_version() {
         let good = bytes(&Snapshot::capture(&rich_document()).unwrap());
         let mut bad = good.clone();
         bad[0] ^= 1;
         assert!(open(&bad).is_err());
         let mut future = good.clone();
-        future[8..12].copy_from_slice(&5u32.to_le_bytes());
+        future[8..12].copy_from_slice(&6u32.to_le_bytes());
         let err = open(&future).unwrap_err().to_string();
-        assert!(err.contains("version 5"), "{err}");
+        assert!(err.contains("version 6"), "{err}");
         assert!(open(&[]).is_err());
     }
 
@@ -688,7 +785,18 @@ mod tests {
             italic: true,
             align: TextAlign::Right,
         };
-        assert!(d.set_text_styled(id, "Styled\nbox", 90., true, 28., style));
+        assert!(d.set_text_styled(
+            id,
+            "Styled\nbox",
+            90.,
+            true,
+            28.,
+            style,
+            "Sans",
+            "Regular",
+            TextEffect::None,
+            None
+        ));
         d
     }
 
@@ -696,7 +804,6 @@ mod tests {
     fn text_styles_persist_and_older_files_stay_plain() -> Result<()> {
         let d = styled_text_document();
         let good = bytes(&Snapshot::capture(&d)?);
-        assert_eq!(&good[8..12], &4u32.to_le_bytes(), "writer emits v4");
         let loaded = open(&good)?;
         assert_eq!(loaded.marks[0].text_style, d.marks[0].text_style);
         assert_eq!(loaded.into_document()?.render()?, d.render()?);

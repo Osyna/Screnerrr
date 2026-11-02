@@ -33,6 +33,8 @@ const MAX_SCALE: f32 = 1.0e4;
 const MAX_TRANSLATE: f32 = 1.0e8;
 /// Line widths and arrowhead multipliers a mark may carry.
 pub const MAX_WIDTH: f64 = 128.0;
+/// Thinnest line a mark may carry; widths are decimal.
+pub const MIN_WIDTH: f64 = 0.1;
 pub const MAX_HEAD_SIZE: f64 = 16.0;
 /// Text sizes in local units; `DEFAULT_FONT` is what constructors assign.
 pub const MAX_FONT: f64 = 2_000.0;
@@ -47,6 +49,19 @@ const TEXT_PAD: f32 = 4.0;
 /// Outward pad on x spans interpolated along slanted edges, so f64 rounding can never shave a
 /// partially covered pixel off the redaction. Vertex coordinates are used exactly.
 const COVER_PAD: f64 = 1e-6;
+/// Family every mark starts with; Pango resolves it to the desktop's default sans.
+pub const DEFAULT_FAMILY: &str = "Sans";
+/// Pango style a mark starts with, and the longest style string it may carry.
+pub const DEFAULT_FONT_STYLE: &str = "Regular";
+pub const MAX_FONT_STYLE: usize = 64;
+/// Longest family list (`"A, B, C"`: first match wins) a mark or preset may carry.
+pub const MAX_FAMILY: usize = 256;
+/// Largest rectangle corner radius a mark or preset may carry, in local units.
+pub const MAX_RADIUS: f64 = MAX_COORD as f64;
+/// Stroke miter limit of the square-ended style: a corner tip reaches at most one line width.
+const SHARP_MITER: f64 = 2.0;
+/// Bézier handle length, as a fraction of the radius, of a quarter circle.
+const KAPPA: f64 = 0.552_284_749_830_793_4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Crop {
@@ -294,6 +309,9 @@ pub enum MarkKind {
     /// `points` = [top-left, bottom-right]: a filled rectangle in `color` (alpha included) drawn in
     /// z-order like any annotation, e.g. a text highlight. Privacy masks stay above it.
     Highlight,
+    /// Freehand marker: `points` is a polyline stroked at `width` in `color` (alpha included) as
+    /// one shape, so a stroke crossing itself never darkens. Never closed and never recognised.
+    Highlighter,
 }
 
 /// Horizontal alignment of the lines of a text mark inside its box.
@@ -304,6 +322,116 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// Decoration painted behind the glyphs of a caption, which stay in the mark colour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextEffect {
+    #[default]
+    None,
+    /// Outline in the inverse of the text colour.
+    InvertedOutline,
+    /// Outline in black or white, whichever contrasts with the text colour.
+    ContrastOutline,
+    /// Black copy at half opacity, offset down and to the right.
+    Shadow,
+}
+
+impl TextEffect {
+    pub const ALL: [TextEffect; 4] = [
+        Self::None,
+        Self::InvertedOutline,
+        Self::ContrastOutline,
+        Self::Shadow,
+    ];
+
+    /// Next effect in the cycle None, inverted outline, contrast outline, shadow, None.
+    pub fn next(self) -> Self {
+        let at = Self::ALL.iter().position(|e| *e == self).unwrap_or(0);
+        Self::ALL[(at + 1) % Self::ALL.len()]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "No effect",
+            Self::InvertedOutline => "Inverted outline",
+            Self::ContrastOutline => "Contrast outline",
+            Self::Shadow => "Drop shadow",
+        }
+    }
+
+    fn outline_width(size: f64) -> f64 {
+        (size * 0.12).max(1.0)
+    }
+
+    fn shadow_offset(size: f64) -> f64 {
+        (size / 16.0).max(1.0)
+    }
+
+    /// How far the effect paints beyond the glyph box of text `size` pixels tall.
+    fn reach(self, size: f64) -> f32 {
+        (match self {
+            Self::None => 0.0,
+            Self::InvertedOutline | Self::ContrastOutline => Self::outline_width(size) / 2.0,
+            Self::Shadow => Self::shadow_offset(size),
+        }) as f32
+    }
+
+    /// Paints the effect of `layout` placed at `origin`, under the glyphs the caller draws next.
+    fn paint(
+        self,
+        cr: &Cairo,
+        layout: &Layout,
+        origin: &Point,
+        color: &[f64; 4],
+        size: f64,
+    ) -> Result<()> {
+        let contrast = if luminance(color) > 0.5 { 0.0 } else { 1.0 };
+        let (x, y) = (f64::from(origin.x), f64::from(origin.y));
+        match self {
+            Self::None => {}
+            Self::Shadow => {
+                let d = Self::shadow_offset(size);
+                cr.set_source_rgba(0.0, 0.0, 0.0, color[3] * 0.5);
+                cr.move_to(x + d, y + d);
+                pangocairo::functions::show_layout(cr, layout);
+            }
+            Self::InvertedOutline | Self::ContrastOutline => {
+                let rgb = if self == Self::InvertedOutline {
+                    [1.0 - color[0], 1.0 - color[1], 1.0 - color[2]]
+                } else {
+                    [contrast; 3]
+                };
+                cr.set_source_rgba(rgb[0], rgb[1], rgb[2], color[3]);
+                cr.set_line_width(Self::outline_width(size));
+                cr.set_line_join(LineJoin::Round);
+                cr.move_to(x, y);
+                pangocairo::functions::layout_path(cr, layout);
+                cr.stroke()?;
+            }
+        }
+        cr.set_source_rgba(color[0], color[1], color[2], color[3]);
+        Ok(())
+    }
+}
+
+impl Mark {
+    /// Radius and stroke width of the outer ring of a step marker.
+    fn ring(&self) -> (f64, f64) {
+        let r = step_radius(self.width);
+        (r * 1.3, (r * 0.12).max(1.0))
+    }
+
+    /// Outer radius of a step marker, ring included.
+    fn step_outer(&self) -> f64 {
+        if self.step_ring {
+            let (r, w) = self.ring();
+            r + w / 2.0
+        } else {
+            step_radius(self.width)
+        }
+    }
 }
 
 /// Rich style of a text mark. Marks stored before it existed load as plain left-aligned text.
@@ -361,6 +489,13 @@ pub struct MarkEdit {
     pub align: Option<TextAlign>,
     pub radius: Option<f64>,
     pub dim: Option<f64>,
+    pub fill: Option<bool>,
+    pub round_caps: Option<bool>,
+    pub corner_radius: Option<f64>,
+    pub font_family: Option<String>,
+    pub font_style: Option<String>,
+    pub text_effect: Option<TextEffect>,
+    pub step_ring: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -384,10 +519,50 @@ pub struct Mark {
     pub font_size: f64,
     #[serde(default)]
     pub text_style: TextStyle,
+    /// Closed paths are filled with `color`; ignored by every other kind.
+    #[serde(default)]
+    pub fill: bool,
+    /// Round caps and joins (the original look); off gives butt caps and mitred corners.
+    #[serde(default = "yes")]
+    pub round_caps: bool,
+    /// Corner radius in local units of a rectangle path; 0 keeps square corners.
+    #[serde(default)]
+    pub corner_radius: f64,
+    /// Pango family list of text and step numbers.
+    #[serde(default = "sans")]
+    pub font_family: String,
+    /// Pango style string of text and step numbers ("Regular", "Heavy", "Light Italic").
+    #[serde(default = "regular")]
+    pub font_style: String,
+    /// Decoration of caption glyphs.
+    #[serde(default)]
+    pub text_effect: TextEffect,
+    /// Outer ring of a step marker.
+    #[serde(default)]
+    pub step_ring: bool,
 }
 
 fn one() -> f64 {
     1.0
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn sans() -> String {
+    DEFAULT_FAMILY.to_owned()
+}
+
+fn regular() -> String {
+    DEFAULT_FONT_STYLE.to_owned()
+}
+
+/// Whether `style` can be stored: a non-blank Pango style string, bounded, no control characters.
+pub fn valid_font_style(style: &str) -> bool {
+    !style.trim().is_empty()
+        && style.len() <= MAX_FONT_STYLE
+        && !style.chars().any(char::is_control)
 }
 
 /// Upgrades marks read from a version-1 project, which stored neither head nor font size: text was
@@ -436,8 +611,99 @@ fn mosaic_pattern() -> Option<SurfacePattern> {
     Some(pattern)
 }
 
+/// Whether `family` can be stored on a mark or preset: a non-blank Pango family list that is
+/// bounded and free of control characters.
+pub fn valid_family(family: &str) -> bool {
+    !family.trim().is_empty() && family.len() <= MAX_FAMILY && !family.chars().any(char::is_control)
+}
+
+/// Installed family names, sorted, for font pickers. A name holding a comma could not be told
+/// apart from a list of families, so it is left out.
+pub fn installed_families() -> Vec<String> {
+    use gtk::pango::prelude::FontFamilyExt;
+    let mut names: Vec<String> = pangocairo::FontMap::default()
+        .list_families()
+        .iter()
+        .map(|f| f.name().to_string())
+        .filter(|n| valid_family(n) && !n.contains(','))
+        .collect();
+    names.sort_by_cached_key(|n| n.to_lowercase());
+    names.dedup();
+    names.truncate(4096);
+    names
+}
+
+/// Pango weight at which a face counts as bold (Semibold).
+const BOLD_WEIGHT: i32 = 600;
+
+fn parsed_face(font_style: &str) -> FontDescription {
+    FontDescription::from_string(&format!("{DEFAULT_FAMILY} {}", font_style.trim()))
+}
+
+/// The rich bold and italic toggles a Pango style string stands for: bold when its weight is
+/// Semibold or heavier, italic for any slant (Italic or Oblique). A caption that starts from
+/// these shows exactly the face the style names, and switching a toggle off or on then really
+/// changes it. Alignment is left.
+pub fn font_style_defaults(font_style: &str) -> TextStyle {
+    use gtk::glib::translate::IntoGlib;
+    let face = parsed_face(font_style);
+    TextStyle {
+        bold: face.weight().into_glib() >= BOLD_WEIGHT,
+        italic: face.style() != Style::Normal,
+        align: TextAlign::Left,
+    }
+}
+
+/// The one font description every text surface (paint, metrics, live caption editor) uses, so a
+/// caption looks and measures the same while it is typed and once it is saved. `size` is in
+/// absolute pixels; `family` is a Pango family list, so a missing first choice falls through.
+/// `font_style` is a Pango style string ("Regular", "Heavy", "Light Italic", "Condensed Bold"):
+/// its weight, slant, variant and stretch are taken. The rich toggles are then authoritative:
+/// `bold` keeps a configured Semibold-or-heavier weight or else uses Bold, and `bold == false`
+/// turns such a weight into Normal while keeping a lighter one (Light, Medium); `italic` keeps a
+/// configured Italic or Oblique or else uses Italic, and `italic == false` makes it upright.
+/// An unrecognised word is ignored, so a bad style reads as Regular.
+pub fn font_description(
+    family: &str,
+    font_style: &str,
+    size: f64,
+    style: TextStyle,
+) -> FontDescription {
+    use gtk::glib::translate::IntoGlib;
+    let family = family.trim();
+    let mut font = parsed_face(font_style);
+    let configured = (font.weight(), font.style());
+    font.set_family(if family.is_empty() {
+        DEFAULT_FAMILY
+    } else {
+        family
+    });
+    font.set_absolute_size(size * f64::from(SCALE));
+    let heavy = configured.0.into_glib() >= BOLD_WEIGHT;
+    font.set_weight(match (style.bold, heavy) {
+        (true, true) => configured.0,
+        (true, false) => Weight::Bold,
+        (false, true) => Weight::Normal,
+        (false, false) => configured.0,
+    });
+    font.set_style(match (style.italic, configured.1) {
+        (true, Style::Normal) => Style::Italic,
+        (true, slant) => slant,
+        (false, _) => Style::Normal,
+    });
+    font
+}
+
 /// Pango layout for a text mark; shared by paint and measurement so both shape identically.
-fn text_layout(cr: &Cairo, text: &str, size: f64, wrap: f64, style: TextStyle) -> Layout {
+fn text_layout(
+    cr: &Cairo,
+    text: &str,
+    family: &str,
+    font_style: &str,
+    size: f64,
+    wrap: f64,
+    style: TextStyle,
+) -> Layout {
     // Pango handles Unicode and shaping; Cairo's toy text API does not.
     let layout = pangocairo::functions::create_layout(cr);
     // Metrics must not depend on the target surface or CTM (image: hinted, PDF/SVG: not), or the
@@ -447,15 +713,7 @@ fn text_layout(cr: &Cairo, text: &str, size: f64, wrap: f64, style: TextStyle) -
         pangocairo::functions::context_set_font_options(&layout.context(), Some(&options));
         layout.context_changed();
     }
-    let mut font = FontDescription::from_string("Sans");
-    font.set_absolute_size(size * f64::from(SCALE));
-    if style.bold {
-        font.set_weight(Weight::Bold);
-    }
-    if style.italic {
-        font.set_style(Style::Italic);
-    }
-    layout.set_font_description(Some(&font));
+    layout.set_font_description(Some(&font_description(family, font_style, size, style)));
     layout.set_alignment(match style.align {
         TextAlign::Left => Alignment::Left,
         TextAlign::Center => Alignment::Center,
@@ -505,15 +763,26 @@ struct Metrics {
 /// Exact inputs of one measurement (floats by bit pattern, so equality is total).
 struct MetricsKey<T> {
     text: T,
+    family: T,
+    font_style: T,
     size: u64,
     wrap: u64,
     style: TextStyle,
 }
 
 impl<'a> MetricsKey<&'a str> {
-    fn new(text: &'a str, size: f64, wrap: f64, style: TextStyle) -> Self {
+    fn new(
+        text: &'a str,
+        family: &'a str,
+        font_style: &'a str,
+        size: f64,
+        wrap: f64,
+        style: TextStyle,
+    ) -> Self {
         Self {
             text,
+            family,
+            font_style,
             size: size.to_bits(),
             wrap: wrap.to_bits(),
             style,
@@ -523,6 +792,8 @@ impl<'a> MetricsKey<&'a str> {
     fn hash(&self) -> u64 {
         let mut h = DefaultHasher::new();
         self.text.hash(&mut h);
+        self.family.hash(&mut h);
+        self.font_style.hash(&mut h);
         (self.size, self.wrap, self.style.bold, self.style.italic).hash(&mut h);
         (self.style.align as u8).hash(&mut h);
         h.finish()
@@ -545,7 +816,12 @@ impl MetricsCache {
         }
         let m = self.entries.get(&hash)?;
         let k = &m.key;
-        (*k.text == *key.text && k.size == key.size && k.wrap == key.wrap && k.style == key.style)
+        (*k.text == *key.text
+            && *k.family == *key.family
+            && *k.font_style == *key.font_style
+            && k.size == key.size
+            && k.wrap == key.wrap
+            && k.style == key.style)
             .then_some(m.bounds)
     }
 
@@ -562,6 +838,8 @@ impl MetricsCache {
         self.text_bytes += key.text.len();
         let key = MetricsKey {
             text: Box::from(key.text),
+            family: Box::from(key.family),
+            font_style: Box::from(key.font_style),
             size: key.size,
             wrap: key.wrap,
             style: key.style,
@@ -575,14 +853,30 @@ thread_local! {
 }
 
 /// Logical Pango rectangle of `text` relative to its origin, in the units `paint` draws it in.
-fn text_extents(text: &str, size: f64, wrap: f64, style: TextStyle) -> Option<Bounds> {
-    let key = MetricsKey::new(text, size, wrap, style);
+fn text_extents(
+    text: &str,
+    family: &str,
+    font_style: &str,
+    size: f64,
+    wrap: f64,
+    style: TextStyle,
+) -> Option<Bounds> {
+    let key = MetricsKey::new(text, family, font_style, size, wrap, style);
     let (hash, fonts) = (key.hash(), pangocairo::FontMap::default().serial());
     if let Some(b) = METRICS.with_borrow_mut(|c| c.get(hash, &key, fonts)) {
         return Some(b);
     }
-    let b =
-        MEASURE.with(|cr| Some(logical(&text_layout(cr.as_ref()?, text, size, wrap, style))))?;
+    let b = MEASURE.with(|cr| {
+        Some(logical(&text_layout(
+            cr.as_ref()?,
+            text,
+            family,
+            font_style,
+            size,
+            wrap,
+            style,
+        )))
+    })?;
     METRICS.with_borrow_mut(|c| c.put(hash, &key, b));
     Some(b)
 }
@@ -710,6 +1004,103 @@ fn rounded_rect(cr: &Cairo, m: &Mark, radius: f64) {
     cr.arc(x + r, y + h - r, r, FRAC_PI_2, PI);
     cr.arc(x + r, y + r, r, PI, PI + FRAC_PI_2);
     cr.close_path();
+}
+
+/// A closed four-point path that is a rectangle (right angles, any rotation): corner `o`, unit
+/// edge directions `ux` (towards the second point) and `uy` (towards the last), and side lengths.
+/// Only these may have rounded corners; every other polygon keeps its own.
+struct Frame {
+    o: Point,
+    ux: (f64, f64),
+    uy: (f64, f64),
+    w: f64,
+    h: f64,
+}
+
+impl Frame {
+    fn of(points: &[Point]) -> Option<Self> {
+        let [a, b, c, d] = points else {
+            return None;
+        };
+        let v = |p: &Point, q: &Point| (f64::from(q.x - p.x), f64::from(q.y - p.y));
+        let (e1, e2, diag) = (v(a, b), v(a, d), v(a, c));
+        let (w, h) = (e1.0.hypot(e1.1), e2.0.hypot(e2.1));
+        let slack = 1e-3 * w.max(h);
+        (w > 1e-3
+            && h > 1e-3
+            && (e1.0 * e2.0 + e1.1 * e2.1).abs() <= 1e-3 * w * h
+            && (diag.0 - e1.0 - e2.0).abs() <= slack
+            && (diag.1 - e1.1 - e2.1).abs() <= slack)
+            .then(|| Self {
+                o: *a,
+                ux: (e1.0 / w, e1.1 / w),
+                uy: (e2.0 / h, e2.1 / h),
+                w,
+                h,
+            })
+    }
+
+    /// Local position of the frame coordinates `(u, v)`.
+    fn at(&self, u: f64, v: f64) -> (f64, f64) {
+        (
+            f64::from(self.o.x) + self.ux.0 * u + self.uy.0 * v,
+            f64::from(self.o.y) + self.ux.1 * u + self.uy.1 * v,
+        )
+    }
+
+    /// Radius limited so neighbouring corners never overlap.
+    fn limit(&self, radius: f64) -> f64 {
+        radius.clamp(0.0, self.w.min(self.h) / 2.0)
+    }
+
+    /// Signed distance from `q` to the rounded rectangle, negative inside.
+    fn distance(&self, q: Point, radius: f64) -> f64 {
+        let r = self.limit(radius);
+        let (dx, dy) = (f64::from(q.x - self.o.x), f64::from(q.y - self.o.y));
+        let (u, v) = (
+            dx * self.ux.0 + dy * self.ux.1,
+            dx * self.uy.0 + dy * self.uy.1,
+        );
+        let px = (u - self.w / 2.0).abs() - (self.w / 2.0 - r);
+        let py = (v - self.h / 2.0).abs() - (self.h / 2.0 - r);
+        px.max(0.0).hypot(py.max(0.0)) + px.max(py).min(0.0) - r
+    }
+
+    /// Adds the closed outline, in the order of the original points, with quarter-circle corners.
+    fn trace(&self, cr: &Cairo, radius: f64) {
+        let r = self.limit(radius);
+        let k = r * (1.0 - KAPPA);
+        let (w, h) = (self.w, self.h);
+        let line = |(x, y): (f64, f64)| cr.line_to(x, y);
+        let curve =
+            |a: (f64, f64), b: (f64, f64), c: (f64, f64)| cr.curve_to(a.0, a.1, b.0, b.1, c.0, c.1);
+        let (x, y) = self.at(r, 0.0);
+        cr.move_to(x, y);
+        line(self.at(w - r, 0.0));
+        curve(self.at(w - k, 0.0), self.at(w, k), self.at(w, r));
+        line(self.at(w, h - r));
+        curve(self.at(w, h - k), self.at(w - k, h), self.at(w - r, h));
+        line(self.at(r, h));
+        curve(self.at(k, h), self.at(0.0, h - k), self.at(0.0, h - r));
+        line(self.at(0.0, r));
+        curve(self.at(0.0, k), self.at(k, 0.0), self.at(r, 0.0));
+        cr.close_path();
+    }
+}
+
+/// Non-zero winding test, the rule Cairo fills with, of `q` against the closed polygon `points`.
+fn inside(points: &[Point], q: Point) -> bool {
+    let mut winding = 0i32;
+    for (i, a) in points.iter().enumerate() {
+        let b = &points[(i + 1) % points.len()];
+        let cross = (b.x - a.x) * (q.y - a.y) - (q.x - a.x) * (b.y - a.y);
+        if a.y <= q.y {
+            winding += i32::from(b.y > q.y && cross > 0.0);
+        } else {
+            winding -= i32::from(b.y <= q.y && cross < 0.0);
+        }
+    }
+    winding != 0
 }
 
 /// White rounded outline of one spotlight.
@@ -962,6 +1353,13 @@ impl Mark {
             head_size: 1.0,
             font_size: DEFAULT_FONT,
             text_style: TextStyle::default(),
+            fill: false,
+            round_caps: true,
+            corner_radius: 0.0,
+            font_family: sans(),
+            font_style: regular(),
+            text_effect: TextEffect::None,
+            step_ring: false,
         }
     }
 
@@ -1022,6 +1420,14 @@ impl Mark {
         }
     }
 
+    /// Freehand marker through `points`; `color` carries the alpha.
+    pub fn highlighter(id: u64, points: Vec<Point>, color: [f64; 4], width: f64) -> Self {
+        Self {
+            kind: MarkKind::Highlighter,
+            ..Self::path(id, points, false, color, width)
+        }
+    }
+
     /// Dims everything outside the union of all spotlights; `a`/`b` are opposite corners.
     pub fn spotlight(id: u64, a: Point, b: Point) -> Self {
         Self {
@@ -1076,6 +1482,96 @@ impl Mark {
         )
     }
 
+    /// Kinds whose strokes follow `round_caps`.
+    pub fn stroked(&self) -> bool {
+        matches!(
+            self.kind,
+            MarkKind::Path | MarkKind::Connector { .. } | MarkKind::Highlighter
+        )
+    }
+
+    /// Butt caps and mitred corners instead of round ones.
+    fn sharp(&self) -> bool {
+        !self.round_caps && self.stroked()
+    }
+
+    /// How far the stroke reaches past its centre line: half the width, or a whole width where a
+    /// mitred corner has a tip. Every bound and export decision includes it.
+    fn reach(&self) -> f32 {
+        (if self.sharp() {
+            self.width
+        } else {
+            self.width / 2.0
+        }) as f32
+    }
+
+    /// A closed path with at least three corners: the only thing `fill` applies to.
+    pub fn fillable(&self) -> bool {
+        matches!(self.kind, MarkKind::Path) && self.closed && self.points.len() >= 3
+    }
+
+    fn fills(&self) -> bool {
+        self.fill && self.fillable()
+    }
+
+    /// A rectangle path (any rotation), the only shape `corner_radius` rounds.
+    pub fn is_rectangle(&self) -> bool {
+        self.fillable() && Frame::of(&self.points).is_some()
+    }
+
+    /// Outline of a path: the rounded rectangle when it has a radius and is one, else its polygon.
+    fn trace(&self, cr: &Cairo, first: &Point) {
+        if self.corner_radius > 0.0
+            && self.fillable()
+            && let Some(frame) = Frame::of(&self.points)
+        {
+            frame.trace(cr, self.corner_radius);
+            return;
+        }
+        cr.move_to(first.x.into(), first.y.into());
+        for p in &self.points[1..] {
+            cr.line_to(p.x.into(), p.y.into());
+        }
+        if self.closed {
+            cr.close_path();
+        }
+    }
+
+    /// Fills the traced outline and strokes it. A translucent shape is composed as one flat layer
+    /// first, so the stroke over its own fill never shows as a darker rim.
+    fn paint_shape(&self, cr: &Cairo, first: &Point) -> Result<()> {
+        if !self.fills() {
+            self.trace(cr, first);
+            return Ok(cr.stroke()?);
+        }
+        let flat = self.color[3] < 1.0;
+        if flat {
+            cr.push_group();
+            cr.set_source_rgb(self.color[0], self.color[1], self.color[2]);
+        }
+        self.trace(cr, first);
+        let drawn = cr.fill_preserve().and_then(|()| cr.stroke());
+        if flat {
+            let group = cr.pop_group_to_source();
+            drawn?;
+            group?;
+            cr.paint_with_alpha(self.color[3])?;
+            return Ok(());
+        }
+        Ok(drawn?)
+    }
+
+    /// Whether `q` (local space) is in the filled interior of a visible filled shape.
+    fn fill_hit(&self, q: Point) -> bool {
+        if !self.fills() || self.color[3] <= 0.0 {
+            return false;
+        }
+        match Frame::of(&self.points).filter(|_| self.corner_radius > 0.0) {
+            Some(frame) => frame.distance(q, self.corner_radius) <= 0.0,
+            None => inside(&self.points, q),
+        }
+    }
+
     /// Transform the mark is actually drawn, measured and hit with for a stored/preview transform
     /// `tf`: text keeps only the rotation and uniform scale of it, so no gesture can distort glyphs.
     pub fn drawn_transform(&self, tf: Affine) -> Affine {
@@ -1121,11 +1617,14 @@ impl Mark {
                 let first = self.points.first()?;
                 let e = text_extents(
                     value,
+                    &self.font_family,
+                    &self.font_style,
                     self.font_size,
                     f64::from(*box_width),
                     self.text_style,
                 )?;
-                let pad = if *background { TEXT_PAD } else { 0.0 };
+                let pad = if *background { TEXT_PAD } else { 0.0 }
+                    .max(self.text_effect.reach(self.font_size));
                 Bounds {
                     x: first.x + e.x - pad,
                     y: first.y + e.y - pad,
@@ -1136,7 +1635,7 @@ impl Mark {
             }
             MarkKind::Step { .. } => {
                 let c = self.points.first()?;
-                let r = step_radius(self.width) as f32;
+                let r = self.step_outer() as f32;
                 Bounds {
                     x: c.x - r,
                     y: c.y - r,
@@ -1156,7 +1655,7 @@ impl Mark {
                 &self.points[..self.points.len().min(2)],
                 (self.width / 2.0) as f32,
             ),
-            MarkKind::Path => bbox(&self.points, (self.width / 2.0) as f32),
+            MarkKind::Path | MarkKind::Highlighter => bbox(&self.points, self.reach()),
         }
     }
 
@@ -1182,9 +1681,10 @@ impl Mark {
 
     fn local_hit(&self, q: Point, tol: f32) -> bool {
         match &self.kind {
-            MarkKind::Path => self.path_hit(q, tol),
+            MarkKind::Path => self.path_hit(q, tol) || self.fill_hit(q),
+            MarkKind::Highlighter => self.path_hit(q, tol),
             MarkKind::Step { .. } => self.points.first().is_some_and(|&c| {
-                let reach = step_radius(self.width) as f32 + tol;
+                let reach = self.step_outer() as f32 + tol;
                 seg_dist2(q, c, c) <= reach * reach
             }),
             MarkKind::Connector { start, end } => {
@@ -1201,6 +1701,14 @@ impl Mark {
     }
 
     fn path_hit(&self, q: Point, tol: f32) -> bool {
+        // A rounded rectangle is stroked along its arcs, not along the square polygon.
+        if self.corner_radius > 0.0
+            && self.fillable()
+            && let Some(frame) = Frame::of(&self.points)
+        {
+            let reach = self.width / 2.0 + f64::from(tol);
+            return frame.distance(q, self.corner_radius).abs() <= reach;
+        }
         let Some(&first) = self.points.first() else {
             return false;
         };
@@ -1227,8 +1735,14 @@ impl Mark {
     fn draw_inner(&self, cr: &Cairo, tf: Affine, ends: Option<[Point; 2]>) -> Result<()> {
         cr.set_source_rgba(self.color[0], self.color[1], self.color[2], self.color[3]);
         cr.set_line_width(self.width);
-        cr.set_line_cap(LineCap::Round);
-        cr.set_line_join(LineJoin::Round);
+        if self.sharp() {
+            cr.set_line_cap(LineCap::Butt);
+            cr.set_line_join(LineJoin::Miter);
+            cr.set_miter_limit(SHARP_MITER);
+        } else {
+            cr.set_line_cap(LineCap::Round);
+            cr.set_line_join(LineJoin::Round);
+        }
         match &self.kind {
             MarkKind::Connector { start, end } => {
                 let [a, b] = ends.unwrap_or_else(|| [tf.apply(start.point), tf.apply(end.point)]);
@@ -1270,6 +1784,8 @@ impl Mark {
                 let layout = text_layout(
                     cr,
                     value,
+                    &self.font_family,
+                    &self.font_style,
                     self.font_size,
                     f64::from(*box_width),
                     self.text_style,
@@ -1291,6 +1807,8 @@ impl Mark {
                     cr.fill()?;
                     cr.set_source_rgba(self.color[0], self.color[1], self.color[2], self.color[3]);
                 }
+                self.text_effect
+                    .paint(cr, &layout, first, &self.color, self.font_size)?;
                 cr.move_to(first.x.into(), first.y.into());
                 pangocairo::functions::show_layout(cr, &layout);
             }
@@ -1310,14 +1828,37 @@ impl Mark {
                     1.0
                 };
                 cr.set_source_rgb(shade, shade, shade);
-                let layout =
-                    text_layout(cr, &number.to_string(), r * 1.1, 0.0, TextStyle::default());
+                let layout = text_layout(
+                    cr,
+                    &number.to_string(),
+                    &self.font_family,
+                    &self.font_style,
+                    r * 1.1,
+                    0.0,
+                    font_style_defaults(&self.font_style),
+                );
                 let e = logical(&layout);
                 cr.move_to(
                     f64::from(first.x) - f64::from(e.x) - f64::from(e.width) / 2.0,
                     f64::from(first.y) - f64::from(e.y) - f64::from(e.height) / 2.0,
                 );
                 pangocairo::functions::show_layout(cr, &layout);
+                if self.step_ring {
+                    let (ring, stroke) = self.ring();
+                    cr.set_source_rgba(self.color[0], self.color[1], self.color[2], self.color[3]);
+                    cr.set_line_width(stroke);
+                    // The number's move_to left a current point: without this the arc would be
+                    // joined to it by a stroked line across the marker.
+                    cr.new_path();
+                    cr.arc(
+                        first.x.into(),
+                        first.y.into(),
+                        ring,
+                        0.0,
+                        std::f64::consts::TAU,
+                    );
+                    cr.stroke()?;
+                }
             }
             _ if self.points.len() == 1 => {
                 cr.arc(
@@ -1329,16 +1870,7 @@ impl Mark {
                 );
                 cr.fill()?;
             }
-            _ => {
-                cr.move_to(first.x.into(), first.y.into());
-                for p in &self.points[1..] {
-                    cr.line_to(p.x.into(), p.y.into());
-                }
-                if self.closed {
-                    cr.close_path();
-                }
-                cr.stroke()?;
-            }
+            _ => self.paint_shape(cr, first)?,
         }
         Ok(())
     }
@@ -1438,7 +1970,7 @@ fn valid_points(points: &[Point]) -> bool {
 }
 
 fn valid_style(color: &[f64; 4], width: f64) -> bool {
-    color.iter().all(|c| (0.0..=1.0).contains(c)) && (1.0..=MAX_WIDTH).contains(&width)
+    color.iter().all(|c| (0.0..=1.0).contains(c)) && (MIN_WIDTH..=MAX_WIDTH).contains(&width)
 }
 
 fn valid_crop(c: &Crop, width: u32, height: u32) -> bool {
@@ -1491,7 +2023,7 @@ fn validate_mark(m: &Mark) -> Result<()> {
     );
     let n = m.points.len();
     match &m.kind {
-        MarkKind::Path => ensure!(n >= 1, "mark {id}: empty path"),
+        MarkKind::Path | MarkKind::Highlighter => ensure!(n >= 1, "mark {id}: empty path"),
         MarkKind::Text {
             value, box_width, ..
         } => ensure!(
@@ -1529,6 +2061,13 @@ fn validate_mark(m: &Mark) -> Result<()> {
     ensure!(
         matches!(m.kind, MarkKind::Text { .. }) || m.text_style == TextStyle::default(),
         "mark {id}: only text carries a text style"
+    );
+    ensure!(
+        valid_family(&m.font_family)
+            && valid_font_style(&m.font_style)
+            && m.corner_radius.is_finite()
+            && (0.0..=MAX_RADIUS).contains(&m.corner_radius),
+        "mark {id}: invalid font family or corner radius"
     );
     Ok(())
 }
@@ -1978,7 +2517,7 @@ impl Document {
             && self.transform_marks(ids, Affine::translation(delta))
     }
 
-    /// One undoable colour/width change. Channels must be in 0..=1 and width in 1..=128.
+    /// One undoable colour/width change. Channels must be in 0..=1 and width in 0.1..=128.
     pub fn set_style_many(&mut self, ids: &[u64], color: [f64; 4], width: f64) -> bool {
         valid_style(&color, width) && {
             let news = self.modified(ids, |m| {
@@ -1999,13 +2538,32 @@ impl Document {
         background: bool,
         font_size: f64,
     ) -> bool {
-        let Some(style) = self.mark(id).map(|m| m.text_style) else {
+        let Some((style, family, font_style, effect)) = self.mark(id).map(|m| {
+            (
+                m.text_style,
+                m.font_family.clone(),
+                m.font_style.clone(),
+                m.text_effect,
+            )
+        }) else {
             return false;
         };
-        self.set_text_styled(id, value, box_width, background, font_size, style)
+        self.set_text_styled(
+            id,
+            value,
+            box_width,
+            background,
+            font_size,
+            style,
+            &family,
+            &font_style,
+            effect,
+            None,
+        )
     }
 
-    /// `set_text` that also sets the rich style, as the same single undo.
+    /// `set_text` that also sets the rich style, font family, effect and position (see
+    /// `retexted`), as the same single undo.
     pub fn set_text_styled(
         &mut self,
         id: u64,
@@ -2014,19 +2572,28 @@ impl Document {
         background: bool,
         font_size: f64,
         style: TextStyle,
+        family: &str,
+        font_style: &str,
+        effect: TextEffect,
+        at: Option<Point>,
     ) -> bool {
         if value.trim().is_empty() {
             return false;
         }
-        let Some(new) = self.retexted(id, value, box_width, background, font_size, style) else {
+        let Some(new) = self.retexted(
+            id, value, box_width, background, font_size, style, family, font_style, effect, at,
+        ) else {
             return false;
         };
         self.mark(id) != Some(&new) && self.replace_marks(vec![new])
     }
 
-    /// What text mark `id` would become with these values (its transform kept), without touching
-    /// the document; the exact mark `set_text_styled` would store. For live previews. A blank
-    /// value is allowed here (it measures as nothing) but `set_text_styled` refuses it.
+    /// What text mark `id` would become with these values, without touching the document; the
+    /// exact mark `set_text_styled` would store. For live previews. A blank value is allowed here
+    /// (it measures as nothing) but `set_text_styled` refuses it. `at` is the document-space
+    /// position of the caption's origin (as `Document::transform` of its first point gives it):
+    /// when it differs from the current one the mark's transform is shifted by the difference, so
+    /// rotation and scale are kept; `None` keeps the position.
     pub fn retexted(
         &self,
         id: u64,
@@ -2035,11 +2602,17 @@ impl Document {
         background: bool,
         font_size: f64,
         style: TextStyle,
+        family: &str,
+        font_style: &str,
+        effect: TextEffect,
+        at: Option<Point>,
     ) -> Option<Mark> {
         let m = self.mark(id)?;
         if !matches!(m.kind, MarkKind::Text { .. })
             || value.len() > MAX_TEXT
             || !valid_box_width(box_width)
+            || !valid_family(family)
+            || !valid_font_style(font_style)
         {
             return None;
         }
@@ -2051,6 +2624,25 @@ impl Document {
         };
         new.font_size = local_font(m, font_size)?;
         new.text_style = style;
+        new.font_family = family.to_owned();
+        new.font_style = font_style.to_owned();
+        new.text_effect = effect;
+        if let Some(at) = at {
+            if !(at.x.is_finite()
+                && at.y.is_finite()
+                && at.x.abs() <= MAX_COORD
+                && at.y.abs() <= MAX_COORD)
+            {
+                return None;
+            }
+            let origin = m.transform.apply(*m.points.first()?);
+            if let Some(t) = shift(at.x - origin.x, at.y - origin.y) {
+                new.transform = t.multiply(m.transform);
+                if !new.transform.is_sane() {
+                    return None;
+                }
+            }
+        }
         Some(new)
     }
 
@@ -2094,14 +2686,18 @@ impl Document {
         let unit = |v: &f64| (0.0..=1.0).contains(v);
         if !(e.rgb.is_none_or(|c| c.iter().all(unit))
             && e.alpha.is_none_or(|a| unit(&a))
-            && e.width.is_none_or(|w| (1.0..=MAX_WIDTH).contains(&w))
+            && e.width.is_none_or(|w| (MIN_WIDTH..=MAX_WIDTH).contains(&w))
             && e.head_size
                 .is_none_or(|h| (0.0..=MAX_HEAD_SIZE).contains(&h))
             && e.font_px.is_none_or(f64::is_finite)
             && e.box_width.is_none_or(valid_box_width)
             && e.radius
                 .is_none_or(|r| (0.0..=f64::from(MAX_COORD)).contains(&r))
-            && e.dim.is_none_or(|d| unit(&d)))
+            && e.dim.is_none_or(|d| unit(&d))
+            && e.corner_radius
+                .is_none_or(|r| (0.0..=MAX_RADIUS).contains(&r))
+            && e.font_family.as_deref().is_none_or(valid_family)
+            && e.font_style.as_deref().is_none_or(valid_font_style))
         {
             return false;
         }
@@ -2116,6 +2712,35 @@ impl Document {
                 }
                 if let Some(w) = e.width.filter(|_| !text) {
                     m.width = w;
+                }
+            }
+            if let Some(on) = e.fill.filter(|_| m.fillable()) {
+                m.fill = on;
+            }
+            if let Some(on) = e.round_caps.filter(|_| m.stroked()) {
+                m.round_caps = on;
+            }
+            if let Some(r) = e.corner_radius.filter(|_| m.is_rectangle()) {
+                m.corner_radius = r;
+            }
+            if let Some(f) = e
+                .font_family
+                .as_ref()
+                .filter(|_| matches!(m.kind, MarkKind::Text { .. } | MarkKind::Step { .. }))
+            {
+                m.font_family.clone_from(f);
+            }
+            if let Some(f) = e
+                .font_style
+                .as_ref()
+                .filter(|_| matches!(m.kind, MarkKind::Text { .. } | MarkKind::Step { .. }))
+            {
+                m.font_style.clone_from(f);
+                // A caption takes the bold and italic the new style names, so its toggles show
+                // and can undo it; explicit `bold`/`italic` in the same edit still win below.
+                if text {
+                    let d = font_style_defaults(f);
+                    (m.text_style.bold, m.text_style.italic) = (d.bold, d.italic);
                 }
             }
             let local = e.font_px.filter(|_| text).and_then(|px| local_font(m, px));
@@ -2143,6 +2768,10 @@ impl Document {
                     s.bold = e.bold.unwrap_or(s.bold);
                     s.italic = e.italic.unwrap_or(s.italic);
                     s.align = e.align.unwrap_or(s.align);
+                    m.text_effect = e.text_effect.unwrap_or(m.text_effect);
+                }
+                MarkKind::Step { .. } => {
+                    m.step_ring = e.step_ring.unwrap_or(m.step_ring);
                 }
                 MarkKind::Spotlight { radius, dim } => {
                     *radius = e.radius.unwrap_or(*radius);
@@ -3645,7 +4274,7 @@ mod tests {
             ([f64::NAN, 0., 0., 1.], 2.),
             ([1.5, 0., 0., 1.], 2.),
             ([0., 0., 0., -0.1], 2.),
-            ([0., 0., 1., 1.], 0.5),
+            ([0., 0., 1., 1.], 0.05),
             ([0., 0., 1., 1.], 129.),
             ([0., 0., 1., 1.], f64::NAN),
             ([0., 0., 1., 1.], 4.),
@@ -5048,8 +5677,25 @@ mod tests {
     // --- caches: text metrics, id slots, privacy snapshot, Cairo-first framing -----------------
 
     /// A measurement without the cache, as every call was made before it existed.
-    fn measured(text: &str, size: f64, wrap: f64, style: TextStyle) -> Bounds {
-        MEASURE.with(|cr| logical(&text_layout(cr.as_ref().unwrap(), text, size, wrap, style)))
+    fn measured(
+        text: &str,
+        family: &str,
+        font_style: &str,
+        size: f64,
+        wrap: f64,
+        style: TextStyle,
+    ) -> Bounds {
+        MEASURE.with(|cr| {
+            logical(&text_layout(
+                cr.as_ref().unwrap(),
+                text,
+                family,
+                font_style,
+                size,
+                wrap,
+                style,
+            ))
+        })
     }
 
     #[test]
@@ -5082,11 +5728,15 @@ mod tests {
             for text in texts {
                 for (size, wrap) in [(12., 0.), (24.5, 40.), (24.5, 160.)] {
                     for style in styles {
-                        assert_eq!(
-                            text_extents(text, size, wrap, style),
-                            Some(measured(text, size, wrap, style)),
-                            "pass {pass}: {text:?} {size} {wrap} {style:?}"
-                        );
+                        for family in ["Sans", "Serif", "Monospace, Sans"] {
+                            for face in ["Regular", "Heavy", "Light Italic"] {
+                                assert_eq!(
+                                    text_extents(text, family, face, size, wrap, style),
+                                    Some(measured(text, family, face, size, wrap, style)),
+                                    "pass {pass}: {text:?} {family} {face} {size} {wrap} {style:?}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -5122,7 +5772,14 @@ mod tests {
         m.font_size /= 2.;
         m.text_style.bold = true;
         let b = m.local_bounds().unwrap();
-        let fresh = measured("Hello, a much wider world", m.font_size, 0., m.text_style);
+        let fresh = measured(
+            "Hello, a much wider world",
+            &m.font_family,
+            &m.font_style,
+            m.font_size,
+            0.,
+            m.text_style,
+        );
         assert_eq!((b.width, b.height), (fresh.width, fresh.height));
         m.text_style.bold = false;
         m.points[0].x += 50.;
@@ -5142,7 +5799,8 @@ mod tests {
     #[test]
     fn metrics_cache_rejects_collisions_and_stays_bounded() {
         let style = TextStyle::default();
-        let key = |text, size| MetricsKey::new(text, size, 0., style);
+        let key =
+            |text, size| MetricsKey::new(text, DEFAULT_FAMILY, DEFAULT_FONT_STYLE, size, 0., style);
         let wide = Bounds {
             x: 0.,
             y: 0.,
@@ -5163,13 +5821,20 @@ mod tests {
             None,
             "same hash, other size"
         );
-        let wrapped = MetricsKey::new("a", 12., 50., style);
+        let wrapped = MetricsKey::new("a", DEFAULT_FAMILY, DEFAULT_FONT_STYLE, 12., 50., style);
         assert_eq!(cache.get(7, &wrapped, 0), None, "same hash, other wrap");
         let bold = TextStyle {
             bold: true,
             ..style
         };
-        assert_eq!(cache.get(7, &MetricsKey::new("a", 12., 0., bold), 0), None);
+        assert_eq!(
+            cache.get(
+                7,
+                &MetricsKey::new("a", DEFAULT_FAMILY, DEFAULT_FONT_STYLE, 12., 0., bold),
+                0
+            ),
+            None
+        );
         cache.put(7, &key("b", 12.), narrow);
         assert_eq!(
             cache.get(7, &key("a", 12.), 0),
@@ -5507,7 +6172,18 @@ mod tests {
             align: TextAlign::Right,
             ..TextStyle::default()
         };
-        assert!(doc.set_text_styled(1, "Hi", 120., false, 20., right));
+        assert!(doc.set_text_styled(
+            1,
+            "Hi",
+            120.,
+            false,
+            20.,
+            right,
+            "Sans",
+            "Regular",
+            TextEffect::None,
+            None
+        ));
         assert_eq!(doc.mark(1).unwrap().text_style, right);
         let right_ink = ink(&doc);
         assert!(
@@ -5521,7 +6197,18 @@ mod tests {
             align: TextAlign::Center,
             ..TextStyle::default()
         };
-        assert!(doc.set_text_styled(1, "Hi", 120., false, 20., centre));
+        assert!(doc.set_text_styled(
+            1,
+            "Hi",
+            120.,
+            false,
+            20.,
+            centre,
+            "Sans",
+            "Regular",
+            TextEffect::None,
+            None
+        ));
         assert!(ink(&doc).iter().all(|&x| (40..100).contains(&x)));
 
         for style in [
@@ -5534,14 +6221,36 @@ mod tests {
                 ..TextStyle::default()
             },
         ] {
-            assert!(doc.set_text_styled(1, "Hi", 120., false, 20., style));
+            assert!(doc.set_text_styled(
+                1,
+                "Hi",
+                120.,
+                false,
+                20.,
+                style,
+                "Sans",
+                "Regular",
+                TextEffect::None,
+                None
+            ));
             assert_ne!(doc.render()?, plain, "{style:?} must change the glyphs");
         }
         // Plain `set_text` keeps whatever style the mark has; a no-op restyle is no undo step.
         let italic = doc.mark(1).unwrap().text_style;
         assert!(doc.set_text(1, "Hi!", 120., false, 20.));
         assert_eq!(doc.mark(1).unwrap().text_style, italic);
-        assert!(!doc.set_text_styled(1, "Hi!", 120., false, 20., italic));
+        assert!(!doc.set_text_styled(
+            1,
+            "Hi!",
+            120.,
+            false,
+            20.,
+            italic,
+            "Sans",
+            "Regular",
+            TextEffect::None,
+            None
+        ));
         doc.undo();
         assert!(
             matches!(&doc.mark(1).unwrap().kind, MarkKind::Text { value, .. } if value == "Hi")
@@ -5934,7 +6643,18 @@ mod tests {
         assert!(pixels(&paint_text_to_image(&doc, Some(1), &original)?, red) > 0);
 
         let mut edited = doc
-            .retexted(1, "New", 0., false, 24., TextStyle::default())
+            .retexted(
+                1,
+                "New",
+                0.,
+                false,
+                24.,
+                TextStyle::default(),
+                "Sans",
+                "Regular",
+                TextEffect::None,
+                None,
+            )
             .unwrap();
         edited.color = [0., 1., 0., 1.];
         let marks = doc.marks.clone();
@@ -5967,5 +6687,795 @@ mod tests {
             "mask covers the preview"
         );
         Ok(())
+    }
+
+    // --- filled shapes, rounded rectangles, caps, highlighters and fonts ------------------------
+
+    fn rect_mark(id: u64, color: [f64; 4], width: f64) -> Mark {
+        Mark::path(
+            id,
+            vec![
+                point(10., 10.),
+                point(50., 10.),
+                point(50., 40.),
+                point(10., 40.),
+            ],
+            true,
+            color,
+            width,
+        )
+    }
+
+    #[test]
+    fn filled_shapes_hit_their_interior_and_transparent_ones_click_through() -> Result<()> {
+        let mut doc = big(80, 60)?;
+        let centre = point(30., 25.);
+        doc.add(rect_mark(1, RED, 2.));
+        assert_eq!(
+            doc.hit_test(centre, 0.),
+            None,
+            "an outline is not hit inside"
+        );
+        assert!(doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                fill: Some(true),
+                ..MarkEdit::default()
+            }
+        ));
+        assert_eq!(doc.hit_test(centre, 0.), Some(1));
+        assert_eq!(doc.hit_test(point(70., 25.), 0.), None);
+        assert!(doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                alpha: Some(0.),
+                ..MarkEdit::default()
+            }
+        ));
+        assert_eq!(
+            doc.hit_test(centre, 0.),
+            None,
+            "fully transparent: click through"
+        );
+        assert!(doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                alpha: Some(0.3),
+                ..MarkEdit::default()
+            }
+        ));
+        assert_eq!(
+            doc.hit_test(centre, 0.),
+            Some(1),
+            "translucent fills are solid targets"
+        );
+
+        // An ellipse is hit in its curve, not in the corners of its box.
+        let mut ellipse = Mark::path(
+            2,
+            (0..96)
+                .map(|i| {
+                    let t = i as f32 / 96. * std::f32::consts::TAU;
+                    point(40. + 20. * t.cos(), 30. + 15. * t.sin())
+                })
+                .collect(),
+            true,
+            RED,
+            2.,
+        );
+        ellipse.fill = true;
+        // On its own: the rectangle above would otherwise be the thing hit at (22, 17).
+        let mut alone = big(80, 60)?;
+        alone.add(ellipse);
+        assert_eq!(alone.hit_test(point(40., 30.), 0.), Some(2));
+        assert_eq!(
+            alone.hit_test(point(22., 17.), 0.),
+            None,
+            "inside the box, outside the curve"
+        );
+
+        // An open path has no interior whatever its flag says.
+        let mut open = shape(3, &[(0., 50.), (30., 50.), (30., 59.)], false);
+        open.fill = true;
+        assert_eq!(open.hit_test(point(20., 55.), 0.), false);
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_corners_apply_to_rectangles_only_and_shape_the_hit_and_the_pixels() -> Result<()> {
+        let mut square = rect_mark(1, RED, 2.);
+        assert!(square.is_rectangle());
+        // The same rectangle turned 30 degrees is still one.
+        let turned = Mark {
+            points: square
+                .points
+                .iter()
+                .map(|p| Affine::rotation_about(0.5, point(30., 25.)).apply(*p))
+                .collect(),
+            ..square.clone()
+        };
+        assert!(turned.is_rectangle());
+        let kite = shape(2, &[(10., 10.), (50., 20.), (30., 40.), (12., 30.)], true);
+        let triangle = shape(3, &[(10., 10.), (50., 10.), (30., 40.)], true);
+        let slanted = shape(4, &[(10., 10.), (50., 10.), (60., 40.), (20., 40.)], true);
+        let ellipse = Mark::path(
+            5,
+            (0..96)
+                .map(|i| {
+                    let t = i as f32 / 96. * std::f32::consts::TAU;
+                    point(40. + 20. * t.cos(), 30. + 15. * t.sin())
+                })
+                .collect(),
+            true,
+            RED,
+            2.,
+        );
+        for other in [&kite, &triangle, &slanted, &ellipse] {
+            assert!(!other.is_rectangle(), "{:?}", other.points);
+        }
+
+        let round = |radius: f64, shape: &Mark| -> Result<RgbaImage> {
+            let mut doc = big(80, 60)?;
+            let mut m = shape.clone();
+            m.fill = true;
+            m.corner_radius = radius;
+            doc.add(m);
+            doc.render()
+        };
+        let sharp = round(0., &square)?;
+        let rounded = round(10., &square)?;
+        // Pixel (10, 10) is the square corner, 13.4 px from the arc's centre: beyond the arc and
+        // its 1 px half-stroke, so a rounded corner leaves the background there.
+        assert_eq!(sharp.get_pixel(10, 10).0, [255, 0, 0, 255]);
+        assert_eq!(
+            rounded.get_pixel(10, 10).0,
+            [20, 40, 60, 255],
+            "the corner is cut"
+        );
+        assert_eq!(rounded.get_pixel(30, 25), sharp.get_pixel(30, 25));
+        for other in [&triangle, &kite, &slanted, &ellipse] {
+            assert_eq!(round(10., other)?, round(0., other)?, "{:?}", other.points);
+        }
+
+        let mut doc = big(80, 60)?;
+        square.fill = true;
+        square.corner_radius = 10.;
+        doc.add(square);
+        assert_eq!(doc.hit_test(point(11.5, 11.5), 0.), None, "outside the arc");
+        assert_eq!(doc.hit_test(point(20., 20.), 0.), Some(1));
+
+        // Without a fill only the arc is a target, not the removed square corner.
+        assert!(doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                fill: Some(false),
+                ..MarkEdit::default()
+            }
+        ));
+        assert_eq!(doc.hit_test(point(10., 10.), 0.), None, "removed corner");
+        assert_eq!(doc.hit_test(point(12.93, 12.93), 0.), Some(1), "on the arc");
+        assert_eq!(doc.hit_test(point(30., 10.), 0.), Some(1), "straight edge");
+        Ok(())
+    }
+
+    #[test]
+    fn translucent_fill_and_outline_form_one_flat_layer() -> Result<()> {
+        let mut doc = big(80, 60)?;
+        let mut m = rect_mark(1, [1., 0., 0., 0.5], 6.);
+        m.fill = true;
+        doc.add(m);
+        let img = doc.render()?;
+        let inner = img.get_pixel(30, 25);
+        assert_ne!(*inner, image::Rgba([20, 40, 60, 255]), "the fill shows");
+        // Inner half of the outline, outer half and interior share one colour: no darker rim.
+        assert_eq!(img.get_pixel(11, 25), inner);
+        assert_eq!(img.get_pixel(8, 25), inner);
+        Ok(())
+    }
+
+    #[test]
+    fn highlighter_crossing_itself_does_not_darken_but_two_marks_do() -> Result<()> {
+        let yellow = [1., 1., 0., 0.4];
+        let cross = vec![
+            point(10., 30.),
+            point(50., 30.),
+            point(30., 10.),
+            point(30., 50.),
+        ];
+        let mut doc = big(60, 60)?;
+        doc.add(Mark::highlighter(1, cross, yellow, 8.));
+        let img = doc.render()?;
+        let single = *img.get_pixel(15, 30);
+        assert_ne!(single, image::Rgba([20, 40, 60, 255]));
+        assert_eq!(
+            *img.get_pixel(30, 30),
+            single,
+            "the crossing keeps the same tint"
+        );
+        assert_eq!(*img.get_pixel(30, 45), single);
+
+        let mut two = big(60, 60)?;
+        two.add(Mark::highlighter(
+            1,
+            vec![point(10., 30.), point(50., 30.)],
+            yellow,
+            8.,
+        ));
+        two.add(Mark::highlighter(
+            2,
+            vec![point(30., 10.), point(30., 50.)],
+            yellow,
+            8.,
+        ));
+        assert_ne!(
+            *two.render()?.get_pixel(30, 30),
+            single,
+            "separate highlights still stack"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn butt_caps_end_flat_and_the_bounds_contain_the_mitres() -> Result<()> {
+        let line = |round: bool| {
+            let mut m = Mark::path(1, vec![point(20., 20.), point(40., 20.)], false, RED, 10.);
+            m.round_caps = round;
+            m
+        };
+        let render = |m: Mark| -> Result<RgbaImage> {
+            let mut doc = big(60, 40)?;
+            doc.add(m);
+            doc.render()
+        };
+        let (round, flat) = (render(line(true))?, render(line(false))?);
+        assert_eq!(round.get_pixel(17, 20).0, [255, 0, 0, 255]);
+        assert_eq!(
+            flat.get_pixel(17, 20).0,
+            [20, 40, 60, 255],
+            "no cap past the end"
+        );
+        assert_eq!(flat.get_pixel(30, 20), round.get_pixel(30, 20));
+
+        // A sharp corner's tip is painted; every painted pixel lies inside the reported bounds.
+        let mut v = shape(1, &[(10., 30.), (30., 10.), (50., 30.)], false);
+        v.width = 8.;
+        v.round_caps = false;
+        let b = v.bounds().unwrap();
+        let img = render(v)?;
+        for (x, y, p) in img.enumerate_pixels() {
+            if p.0 != [20, 40, 60, 255] {
+                let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+                assert!(
+                    x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height,
+                    "{x},{y} outside {b:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn style_edits_reach_only_the_kinds_that_use_them_and_undo_as_one_step() -> Result<()> {
+        let mut doc = big(80, 60)?;
+        doc.add(rect_mark(1, RED, 2.));
+        doc.add(shape(2, &[(0., 50.), (30., 50.)], false));
+        doc.add(text_mark(3, 4.));
+        doc.add(Mark::step(4, point(60., 40.), 1, RED, 6.));
+        doc.add(Mark::redaction(5, point(0., 0.), point(5., 5.)));
+        let before = doc.marks.clone();
+        let all = [1, 2, 3, 4, 5];
+        let e = MarkEdit {
+            fill: Some(true),
+            round_caps: Some(false),
+            corner_radius: Some(7.),
+            font_family: Some("Serif, Sans".into()),
+            ..MarkEdit::default()
+        };
+        assert!(doc.edit_marks(&all, &e));
+        let m = |id| doc.mark(id).unwrap();
+        assert!(m(1).fill && !m(1).round_caps && m(1).corner_radius == 7.);
+        assert!(
+            !m(2).fill && !m(2).round_caps && m(2).corner_radius == 0.,
+            "open ink: caps only"
+        );
+        assert_eq!(
+            (m(3).font_family.as_str(), m(4).font_family.as_str()),
+            ("Serif, Sans", "Serif, Sans")
+        );
+        assert_eq!(m(1).font_family, DEFAULT_FAMILY, "a rectangle has no font");
+        assert_eq!(*m(5), before[4], "a privacy mask never takes a style");
+        doc.undo();
+        assert_eq!(doc.marks, before);
+        assert!(!doc.can_undo() || doc.revision() > 0);
+
+        for bad in ["", "   ", "Se\nrif", &"x".repeat(MAX_FAMILY + 1)] {
+            let e = MarkEdit {
+                font_family: Some(bad.into()),
+                ..MarkEdit::default()
+            };
+            assert!(!doc.edit_marks(&all, &e), "{bad:?}");
+        }
+        let e = MarkEdit {
+            corner_radius: Some(-1.),
+            ..MarkEdit::default()
+        };
+        assert!(!doc.edit_marks(&all, &e));
+        assert_eq!(doc.marks, before);
+
+        // Copies keep the whole style.
+        assert!(doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                fill: Some(true),
+                ..MarkEdit::default()
+            }
+        ));
+        let copy = doc.duplicate_marks(&[1])[0];
+        assert_eq!(doc.mark(copy).unwrap().fill, true);
+        Ok(())
+    }
+
+    #[test]
+    fn font_family_is_in_the_layout_the_metrics_and_validation() -> Result<()> {
+        let layout = MEASURE.with(|cr| {
+            text_layout(
+                cr.as_ref().unwrap(),
+                "Hi",
+                "Monospace, Serif",
+                DEFAULT_FONT_STYLE,
+                20.,
+                0.,
+                TextStyle::default(),
+            )
+        });
+        let font = layout.font_description().unwrap();
+        assert_eq!(font.family().as_deref(), Some("Monospace, Serif"));
+        let blank = font_description("  ", DEFAULT_FONT_STYLE, 20., TextStyle::default());
+        assert_eq!(blank.family().as_deref(), Some(DEFAULT_FAMILY));
+
+        // Every surface asks `font_description`, so a live caption and the saved mark agree.
+        let mut m = text_mark(1, 4.);
+        for family in ["Sans", "Monospace", "Serif, Sans"] {
+            m.font_family = family.into();
+            let b = m.local_bounds().unwrap();
+            let fresh = measured(
+                "Hello",
+                family,
+                &m.font_style,
+                m.font_size,
+                0.,
+                m.text_style,
+            );
+            assert_eq!((b.width, b.height), (fresh.width, fresh.height), "{family}");
+        }
+        assert!(valid_family("Inter, Noto Sans"));
+        for bad in ["", " ", "a\u{0}b", &"y".repeat(MAX_FAMILY + 1)] {
+            assert!(!valid_family(bad), "{bad:?}");
+        }
+        let mut bad = text_mark(2, 4.);
+        bad.font_family = "x\ny".into();
+        assert!(Document::from_parts(RgbaImage::new(30, 30), vec![bad], None).is_err());
+        let mut neg = rect_mark(3, RED, 2.);
+        neg.corner_radius = f64::NAN;
+        assert!(Document::from_parts(RgbaImage::new(60, 60), vec![neg], None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn privacy_masks_stay_opaque_above_fills_highlights_and_fonts() -> Result<()> {
+        let mut doc = big(60, 50)?;
+        let mut filled = rect_mark(1, [1., 1., 0., 0.5], 6.);
+        filled.fill = true;
+        doc.add(filled);
+        doc.add(Mark::highlighter(
+            2,
+            vec![point(5., 25.), point(55., 25.)],
+            [1., 0., 1., 0.4],
+            14.,
+        ));
+        doc.add(Mark::highlight(
+            3,
+            point(5., 5.),
+            point(55., 45.),
+            [0., 1., 0., 0.4],
+        ));
+        let mut text = Mark::text(4, point(12., 18.), "SECRET", [1., 1., 1., 1.], 4.);
+        text.font_family = "Monospace".into();
+        doc.add(text);
+        doc.add(Mark::redaction(5, point(8., 8.), point(52., 42.)));
+        doc.add(Mark::privacy_blur(6, point(0., 44.), point(10., 50.)));
+        let img = doc.render()?;
+        for (x, y) in [(9, 9), (30, 25), (51, 41), (12, 20)] {
+            assert_eq!(img.get_pixel(x, y).0, [0, 0, 0, 255], "{x},{y}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_effects_paint_behind_the_glyphs_and_grow_the_bounds() -> Result<()> {
+        assert_eq!(
+            TextEffect::ALL.map(|e| e.next()),
+            [
+                TextEffect::InvertedOutline,
+                TextEffect::ContrastOutline,
+                TextEffect::Shadow,
+                TextEffect::None
+            ]
+        );
+        let text = |effect: TextEffect| {
+            let mut m = Mark::text(1, point(15., 10.), "Hi", RED, 4.);
+            m.font_size = 40.;
+            m.text_effect = effect;
+            m
+        };
+        let render = |m: Mark| -> Result<RgbaImage> {
+            let mut doc = big(100, 70)?;
+            doc.add(m);
+            doc.render()
+        };
+        let painted =
+            |img: &RgbaImage, f: fn(&[u8; 4]) -> bool| img.pixels().filter(|p| f(&p.0)).count();
+        let cyan = |p: &[u8; 4]| p[1] > 200 && p[2] > 200 && p[0] < 60;
+        let black = |p: &[u8; 4]| p[0] < 15;
+        let plain = render(text(TextEffect::None))?;
+        assert_eq!(painted(&plain, cyan) + painted(&plain, black), 0);
+        assert!(painted(&render(text(TextEffect::InvertedOutline))?, cyan) > 0);
+        // Red text is dark enough for a white contrast outline, so there is no black.
+        let contrast = render(text(TextEffect::ContrastOutline))?;
+        assert!(contrast.pixels().any(|p| p.0 == [255, 255, 255, 255]));
+        assert!(painted(&render(text(TextEffect::Shadow))?, black) > 0);
+
+        let base = text(TextEffect::None).local_bounds().unwrap();
+        for effect in [
+            TextEffect::InvertedOutline,
+            TextEffect::ContrastOutline,
+            TextEffect::Shadow,
+        ] {
+            let b = text(effect).local_bounds().unwrap();
+            assert!(b.width > base.width && b.height > base.height, "{effect:?}");
+        }
+        // Every painted pixel stays inside the reported bounds, so selection and export see it all.
+        for effect in TextEffect::ALL {
+            let m = text(effect);
+            let b = m.bounds().unwrap();
+            for (x, y, p) in render(m)?.enumerate_pixels() {
+                if p.0 != [20, 40, 60, 255] {
+                    let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+                    assert!(
+                        x >= b.x - 1.
+                            && x <= b.x + b.width + 1.
+                            && y >= b.y - 1.
+                            && y <= b.y + b.height + 1.,
+                        "{effect:?}: {x},{y} outside {b:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn step_ring_is_drawn_hit_and_edited_only_on_steps() -> Result<()> {
+        let mut doc = big(80, 60)?;
+        doc.add(Mark::step(1, point(40., 30.), 1, RED, 4.));
+        doc.add(rect_mark(2, RED, 2.));
+        let plain = doc.mark(1).unwrap().clone();
+        let r = step_radius(4.) as f32;
+        assert_eq!(doc.hit_test(point(40. + r * 1.3, 30.), 0.), None);
+        assert!(doc.edit_marks(
+            &[1, 2],
+            &MarkEdit {
+                step_ring: Some(true),
+                ..MarkEdit::default()
+            }
+        ));
+        assert!(doc.mark(1).unwrap().step_ring && !doc.mark(2).unwrap().step_ring);
+        assert_eq!(doc.hit_test(point(40. + r * 1.3, 30.), 0.), Some(1));
+        let (a, b) = (
+            plain.bounds().unwrap(),
+            doc.mark(1).unwrap().bounds().unwrap(),
+        );
+        assert!(b.width > a.width);
+        let img = doc.render()?;
+        assert!(img.get_pixel(40 + (r * 1.3) as u32, 30).0[0] > 200);
+        let gap = img.get_pixel(40 + (r * 1.15) as u32, 30);
+        assert_eq!(
+            gap.0,
+            [20, 40, 60, 255],
+            "a gap separates the ring from the disc"
+        );
+        doc.undo();
+        assert_eq!(*doc.mark(1).unwrap(), plain);
+        Ok(())
+    }
+
+    #[test]
+    fn decimal_widths_down_to_a_tenth_are_valid_and_old_values_are_unchanged() -> Result<()> {
+        let thin = |w: f64| Mark::path(1, vec![point(2., 2.), point(9., 2.)], false, RED, w);
+        assert!(Document::from_parts(RgbaImage::new(12, 12), vec![thin(MIN_WIDTH)], None).is_ok());
+        assert!(Document::from_parts(RgbaImage::new(12, 12), vec![thin(0.05)], None).is_err());
+        assert!(
+            Document::from_parts(RgbaImage::new(12, 12), vec![thin(MAX_WIDTH + 1.)], None).is_err()
+        );
+        let mut doc = big(20, 12)?;
+        doc.add(thin(3.));
+        assert!(doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                width: Some(0.1),
+                ..MarkEdit::default()
+            }
+        ));
+        assert_eq!(doc.mark(1).unwrap().width, 0.1);
+        assert!(!doc.edit_marks(
+            &[1],
+            &MarkEdit {
+                width: Some(0.09),
+                ..MarkEdit::default()
+            }
+        ));
+        assert!(doc.set_style_many(&[1], RED, 0.5));
+        assert!(!doc.set_style_many(&[1], RED, 0.));
+        Ok(())
+    }
+
+    #[test]
+    fn marks_saved_before_the_new_styles_deserialize_with_the_old_look() {
+        let mut m = Mark::text(1, point(3., 4.), "Old", RED, 3.);
+        let mut v = serde_json::to_value(&m).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for key in [
+            "fill",
+            "round_caps",
+            "corner_radius",
+            "font_family",
+            "text_effect",
+            "step_ring",
+        ] {
+            assert!(o.remove(key).is_some(), "{key}");
+        }
+        m.text_effect = TextEffect::None;
+        assert_eq!(serde_json::from_value::<Mark>(v).unwrap(), m);
+        assert_eq!(
+            serde_json::to_value(TextEffect::ContrastOutline).unwrap(),
+            "contrast-outline"
+        );
+    }
+
+    #[test]
+    fn font_style_strings_set_the_pango_face_survive_storage_and_default_to_regular() {
+        let plain = TextStyle::default();
+        let face = |style: &str, rich: TextStyle| font_description("Serif", style, 20., rich);
+        let regular = face("Regular", plain);
+        assert_eq!(
+            (regular.weight(), regular.style()),
+            (Weight::Normal, Style::Normal)
+        );
+        // Toggles start from what the style string names, so the face is exactly that one.
+        let named = |s: &str| face(s, font_style_defaults(s));
+        assert_eq!(named("Heavy").weight(), Weight::Heavy);
+        assert_eq!(named("Light").weight(), Weight::Light);
+        let light_italic = named("Light Italic");
+        assert_eq!(
+            (light_italic.weight(), light_italic.style()),
+            (Weight::Light, Style::Italic)
+        );
+        // The family and the absolute size are the mark's, whatever the style string says.
+        let sized = face("Heavy 99", font_style_defaults("Heavy"));
+        assert_eq!(sized.family().as_deref(), Some("Serif"));
+        assert_eq!(sized.size(), (20.0 * f64::from(SCALE)) as i32);
+        // Explicit rich toggles win over the style string.
+        let bold = TextStyle {
+            bold: true,
+            ..plain
+        };
+        assert_eq!(face("Light", bold).weight(), Weight::Bold);
+        assert_eq!(face("Regular", bold).weight(), Weight::Bold);
+        assert_eq!(face("Bogus Words", plain).weight(), Weight::Normal);
+
+        // The mark stores it, the cache keys on it, and layouts carry it.
+        let mut m = text_mark(1, 4.);
+        assert_eq!(m.font_style, DEFAULT_FONT_STYLE);
+        m.font_style = "Heavy".into();
+        let layout = MEASURE.with(|cr| {
+            text_layout(
+                cr.as_ref().unwrap(),
+                "Hi",
+                "Sans",
+                &m.font_style,
+                20.,
+                0.,
+                font_style_defaults("Heavy"),
+            )
+        });
+        assert_eq!(layout.font_description().unwrap().weight(), Weight::Heavy);
+        m.text_style = font_style_defaults("Heavy");
+        let heavy = m.local_bounds().unwrap();
+        m.font_style = "Regular".into();
+        m.text_style = plain;
+        let fresh = measured("Hello", "Sans", "Regular", m.font_size, 0., plain);
+        let regular = m.local_bounds().unwrap();
+        assert_eq!((regular.width, regular.height), (fresh.width, fresh.height));
+        m.font_style = "Heavy".into();
+        m.text_style = font_style_defaults("Heavy");
+        assert_eq!(
+            m.local_bounds(),
+            Some(heavy),
+            "a cache hit answers the same"
+        );
+        assert!(
+            heavy.width >= regular.width,
+            "heavy glyphs are never narrower"
+        );
+
+        // Persistence: it roundtrips, an old mark without the key reads Regular, bad ones are refused.
+        let back: Mark = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let mut v = serde_json::to_value(&m).unwrap();
+        assert!(v.as_object_mut().unwrap().remove("font_style").is_some());
+        let old: Mark = serde_json::from_value(v).unwrap();
+        assert_eq!(old.font_style, "Regular");
+        for bad in ["", "  ", "Hea\nvy", &"H".repeat(MAX_FONT_STYLE + 1)] {
+            assert!(!valid_font_style(bad), "{bad:?}");
+            let mut broken = text_mark(2, 4.);
+            broken.font_style = bad.into();
+            assert!(Document::from_parts(RgbaImage::new(30, 30), vec![broken], None).is_err());
+        }
+
+        // One undo step changes the style of captions and steps, and only those.
+        let mut doc = big(80, 60).unwrap();
+        doc.add(text_mark(1, 4.));
+        doc.add(Mark::step(2, point(40., 40.), 1, RED, 4.));
+        doc.add(rect_mark(3, RED, 2.));
+        let before = doc.marks.clone();
+        let edit = MarkEdit {
+            font_style: Some("Heavy".into()),
+            ..MarkEdit::default()
+        };
+        assert!(doc.edit_marks(&[1, 2, 3], &edit));
+        assert_eq!(
+            doc.marks
+                .iter()
+                .map(|m| m.font_style.as_str())
+                .collect::<Vec<_>>(),
+            ["Heavy", "Heavy", "Regular"]
+        );
+        let bad = MarkEdit {
+            font_style: Some(" ".into()),
+            ..MarkEdit::default()
+        };
+        assert!(!doc.edit_marks(&[1], &bad));
+        assert!(
+            doc.marks[0].text_style.bold && !doc.marks[2].text_style.bold,
+            "the caption takes the bold of Heavy; a step has no text style"
+        );
+        doc.undo();
+        assert_eq!(doc.marks, before);
+    }
+
+    #[test]
+    fn bold_and_italic_toggles_turn_a_configured_face_on_and_off() {
+        use gtk::glib::translate::IntoGlib;
+        let weight = |d: &FontDescription| d.weight().into_glib();
+        let face = |style: &str, bold: bool, italic: bool| {
+            font_description(
+                "Serif",
+                style,
+                20.,
+                TextStyle {
+                    bold,
+                    italic,
+                    ..TextStyle::default()
+                },
+            )
+        };
+        // What a style string stands for.
+        let flags = |s: &str| {
+            let d = font_style_defaults(s);
+            (d.bold, d.italic)
+        };
+        assert_eq!(flags("Regular"), (false, false));
+        assert_eq!(flags("Bold"), (true, false));
+        assert_eq!(flags("Bold Italic"), (true, true));
+        assert_eq!(flags("Heavy"), (true, false));
+        assert_eq!(flags("Light Italic"), (false, true));
+        assert_eq!(flags("Medium"), (false, false));
+        assert_eq!(flags("Oblique"), (false, true));
+        assert_eq!(flags("Nonsense"), (false, false));
+
+        // Starting from the defaults shows the configured face exactly...
+        let d = font_style_defaults("Bold Italic");
+        let shown = font_description("Serif", "Bold Italic", 20., d);
+        assert_eq!(
+            (shown.weight(), shown.style()),
+            (Weight::Bold, Style::Italic)
+        );
+        assert_eq!(
+            font_description("Serif", "Heavy", 20., font_style_defaults("Heavy")).weight(),
+            Weight::Heavy
+        );
+        // ...and switching the toggles off really removes bold and slant.
+        let off = face("Bold Italic", false, false);
+        assert_eq!((off.weight(), off.style()), (Weight::Normal, Style::Normal));
+        assert_eq!(face("Heavy", false, false).weight(), Weight::Normal);
+        // Off then on again uses the plain Bold and Italic, or keeps a configured heavier face.
+        let on = face("Regular", true, true);
+        assert_eq!((on.weight(), on.style()), (Weight::Bold, Style::Italic));
+        assert_eq!(face("Heavy", true, false).weight(), Weight::Heavy);
+        assert_eq!(face("Oblique", false, true).style(), Style::Oblique);
+        // A lighter weight is not bold, so turning bold off leaves it, and on gives Bold.
+        assert_eq!(face("Light", false, false).weight(), Weight::Light);
+        assert_eq!(face("Medium", false, false).weight(), Weight::Medium);
+        assert_eq!(
+            weight(&face("Light", true, false)),
+            Weight::Bold.into_glib()
+        );
+        // Width and variant are kept whatever the toggles do.
+        assert_eq!(
+            face("Condensed Bold", false, false).stretch(),
+            gtk::pango::Stretch::Condensed
+        );
+
+        // Pixels: a Bold-configured caption looks bold, unbolds when B is off, and then equals
+        // the Regular one; B on again is bold again.
+        let render = |style: &str, bold: bool, italic: bool| -> RgbaImage {
+            let mut m = Mark::text(1, point(4., 4.), "Wide", [1., 1., 1., 1.], 4.);
+            m.font_size = 28.;
+            m.font_style = style.into();
+            m.text_style = TextStyle {
+                bold,
+                italic,
+                ..TextStyle::default()
+            };
+            let mut doc = big(140, 50).unwrap();
+            doc.add(m);
+            doc.render().unwrap()
+        };
+        let bold = render("Bold", true, false);
+        let unbolded = render("Bold", false, false);
+        let regular = render("Regular", false, false);
+        assert_ne!(bold, regular, "bold glyphs differ from regular ones");
+        assert_eq!(unbolded, regular, "B off removes the configured bold");
+        assert_eq!(
+            render("Regular", true, false),
+            bold,
+            "B on is the same bold"
+        );
+        let slanted = render("Italic", true, true);
+        assert_ne!(render("Italic", false, false), slanted);
+        assert_eq!(
+            render("Italic", false, false),
+            regular,
+            "I off removes the slant"
+        );
+
+        // Changing the style of a caption takes the toggles it names, so they can undo it;
+        // explicit flags in the same edit still win, and steps never get a text style.
+        let mut doc = big(80, 60).unwrap();
+        doc.add(text_mark(1, 4.));
+        doc.add(text_mark(2, 4.));
+        doc.add(Mark::step(3, point(40., 40.), 1, RED, 4.));
+        let styles = |d: &Document| {
+            d.marks
+                .iter()
+                .map(|m| (m.text_style.bold, m.text_style.italic))
+                .collect::<Vec<_>>()
+        };
+        let before = doc.marks.clone();
+        let set = |s: &str, bold: Option<bool>| MarkEdit {
+            font_style: Some(s.into()),
+            bold,
+            ..MarkEdit::default()
+        };
+        assert!(doc.edit_marks(&[1, 3], &set("Bold Italic", None)));
+        assert_eq!(styles(&doc), [(true, true), (false, false), (false, false)]);
+        assert!(doc.edit_marks(&[2], &set("Bold Italic", Some(false))));
+        assert_eq!(styles(&doc)[1], (false, true), "explicit bold wins");
+        assert!(doc.edit_marks(&[1], &set("Regular", None)));
+        assert_eq!(styles(&doc)[0], (false, false));
+        doc.undo();
+        doc.undo();
+        doc.undo();
+        assert_eq!(doc.marks, before);
     }
 }

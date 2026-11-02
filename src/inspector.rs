@@ -6,9 +6,10 @@
 //! differs across the selection.
 
 use crate::{
+    caption::{family_picker, family_position},
     document::{
-        Align, Axis, Bounds, Document, Geometry, MAX_FONT, MAX_HEAD_SIZE, MAX_WIDTH, Mark,
-        MarkEdit, MarkKind, TextAlign,
+        Align, Axis, Bounds, Document, Geometry, MAX_FONT, MAX_HEAD_SIZE, MAX_WIDTH, MIN_WIDTH,
+        Mark, MarkEdit, MarkKind, TextAlign, TextEffect,
     },
     interaction::State,
 };
@@ -55,6 +56,27 @@ impl<T: Copy> Value<T> {
     }
 }
 
+impl Value<String> {
+    fn texts<'a>(items: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut items = items.into_iter();
+        let Some(first) = items.next() else {
+            return Self::Absent;
+        };
+        let first = first.to_owned();
+        if items.all(|t| t == first) {
+            Self::Same(first)
+        } else {
+            Self::Mixed(first)
+        }
+    }
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Absent => None,
+            Self::Same(t) | Self::Mixed(t) => Some(t),
+        }
+    }
+}
+
 fn near(a: f64, b: f64) -> bool {
     (a - b).abs() < 0.05
 }
@@ -83,6 +105,17 @@ pub struct Inspection {
     pub bold: Value<bool>,
     pub italic: Value<bool>,
     pub align: Value<TextAlign>,
+    /// Closed paths only.
+    pub fill: Value<bool>,
+    /// Paths, connectors and highlighters.
+    pub round_caps: Value<bool>,
+    /// Rectangles only.
+    pub rounding: Value<f64>,
+    /// Step markers only.
+    pub ring: Value<bool>,
+    /// Captions and step numbers.
+    pub family: Value<String>,
+    pub effect: Value<TextEffect>,
 }
 
 impl Inspection {
@@ -146,6 +179,7 @@ impl Inspection {
                                 | MarkKind::Step { .. }
                                 | MarkKind::Magnifier { .. }
                                 | MarkKind::Spotlight { .. }
+                                | MarkKind::Highlighter
                         )
                     })
                     .map(|m| m.width),
@@ -181,6 +215,35 @@ impl Inspection {
             bold: flag(|m| m.text_style.bold),
             italic: flag(|m| m.text_style.italic),
             align: Value::of(texts().map(|m| m.text_style.align), |a, b| a == b),
+            fill: Value::of(
+                marks.iter().filter(|m| m.fillable()).map(|m| m.fill),
+                |a, b| a == b,
+            ),
+            round_caps: Value::of(
+                marks.iter().filter(|m| m.stroked()).map(|m| m.round_caps),
+                |a, b| a == b,
+            ),
+            rounding: Value::of(
+                marks
+                    .iter()
+                    .filter(|m| m.is_rectangle())
+                    .map(|m| m.corner_radius),
+                near,
+            ),
+            ring: Value::of(
+                marks
+                    .iter()
+                    .filter(|m| matches!(m.kind, MarkKind::Step { .. }))
+                    .map(|m| m.step_ring),
+                |a, b| a == b,
+            ),
+            family: Value::texts(
+                marks
+                    .iter()
+                    .filter(|m| matches!(m.kind, MarkKind::Text { .. } | MarkKind::Step { .. }))
+                    .map(|m| m.font_family.as_str()),
+            ),
+            effect: Value::of(texts().map(|m| m.text_effect), |a, b| a == b),
         }
     }
 }
@@ -398,6 +461,13 @@ pub struct Inspector {
     italic: (Field, gtk::CheckButton),
     background: (Field, gtk::CheckButton),
     align: (Field, gtk::DropDown),
+    fill: (Field, gtk::CheckButton),
+    round_caps: (Field, gtk::CheckButton),
+    rounding: (Field, gtk::SpinButton),
+    ring: (Field, gtk::CheckButton),
+    family: (Field, gtk::DropDown),
+    families: Vec<String>,
+    effect: (Field, gtk::DropDown),
     align_buttons: Vec<gtk::Button>,
     spread_buttons: Vec<gtk::Button>,
 }
@@ -524,9 +594,9 @@ impl Inspector {
             "Opacity in percent; each object keeps its own colour",
         );
         let stroke = spin(
-            1.,
+            MIN_WIDTH,
             MAX_WIDTH,
-            1.,
+            0.1,
             1,
             "Line width",
             "Line width or marker size in pixels",
@@ -570,6 +640,29 @@ impl Inspector {
         let radius = (Field::new(&grid, 4, "Corner radius", &radius), radius);
         let dim = (Field::new(&grid, 5, "Dimming %", &dim), dim);
         let zoom = (Field::new(&grid, 6, "Lens zoom", &zoom), zoom);
+        let check = |label: &str, tip: &str| {
+            let c = gtk::CheckButton::with_label(label);
+            c.set_tooltip_text(Some(tip));
+            c
+        };
+        let fill = check("Filled", "Fill the inside of the shape with its colour");
+        let round_caps = check(
+            "Round ends",
+            "Round line ends and corners; off gives flat ends and sharp corners",
+        );
+        let rounding = spin(
+            0.,
+            10_000.,
+            1.,
+            0,
+            "Rectangle rounding",
+            "Corner radius of the rectangle in pixels",
+        );
+        let ring = check("Outer ring", "Draw a ring around the numbered marker");
+        let fill = (Field::new(&grid, 7, "Shape", &fill), fill);
+        let round_caps = (Field::new(&grid, 8, "Ends", &round_caps), round_caps);
+        let rounding = (Field::new(&grid, 9, "Rounding", &rounding), rounding);
+        let ring = (Field::new(&grid, 10, "Ring", &ring), ring);
         body.append(&style);
 
         let (text, grid) = section("Text");
@@ -606,6 +699,15 @@ impl Inspector {
         let italic = (Field::new(&grid, 3, "Slant", &italic), italic);
         let align = (Field::new(&grid, 4, "Align", &align), align);
         let background = (Field::new(&grid, 5, "Fill", &background), background);
+        let (family, families) = family_picker(
+            "Font family",
+            "Font family of the selected captions and step numbers · type to search",
+        );
+        let effect = gtk::DropDown::from_strings(&TextEffect::ALL.map(TextEffect::label));
+        effect.set_tooltip_text(Some("Outline or shadow behind the caption"));
+        effect.update_property(&[gtk::accessible::Property::Label("Caption effect")]);
+        let family = (Field::new(&grid, 6, "Font", &family), family);
+        let effect = (Field::new(&grid, 7, "Effect", &effect), effect);
         body.append(&text);
 
         let this = Rc::new(Self {
@@ -636,6 +738,13 @@ impl Inspector {
             italic,
             background,
             align,
+            fill,
+            round_caps,
+            rounding,
+            ring,
+            family,
+            families,
+            effect,
             align_buttons,
             spread_buttons,
         });
@@ -812,6 +921,27 @@ impl Inspector {
                 },
             )
         });
+        self.check(&self.fill.1, |s, on| s.set_fill(on));
+        self.check(&self.round_caps.1, |s, on| s.set_round_caps(on));
+        self.check(&self.ring.1, |s, on| s.set_step_ring(on));
+        self.spin(&self.rounding.1, |s, v| s.set_corner_radius(v));
+        let (weak, families) = (Rc::downgrade(self), self.families.clone());
+        self.family.1.connect_selected_notify(move |d| {
+            if let (Some(this), Some(name)) = (weak.upgrade(), families.get(d.selected() as usize))
+            {
+                this.apply(|s| {
+                    s.set_font_family(name);
+                });
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.effect.1.connect_selected_notify(move |d| {
+            if let (Some(this), Some(effect)) =
+                (weak.upgrade(), TextEffect::ALL.get(d.selected() as usize))
+            {
+                this.apply(|s| s.set_text_effect(*effect));
+            }
+        });
 
         let weak = Rc::downgrade(self);
         self.color.1.connect_color_set(move |b| {
@@ -894,6 +1024,13 @@ impl Inspector {
         put(&self.height, i.height, 1.);
         put(&self.rotation, i.rotation, 1.);
 
+        let flag = |(field, check): &(Field, gtk::CheckButton), v: Value<bool>| {
+            if field.show(&v) {
+                check.set_inconsistent(v.is_mixed());
+                check.set_active(v.first().unwrap_or(false));
+            }
+            !matches!(v, Value::Absent)
+        };
         let rgb = i.rgb.first();
         let shown = [
             self.color.0.show(&i.rgb),
@@ -903,6 +1040,10 @@ impl Inspector {
             put(&self.radius, i.radius, 1.),
             put(&self.dim, i.dim, 100.),
             put(&self.zoom, i.zoom, 1.),
+            flag(&self.fill, i.fill),
+            flag(&self.round_caps, i.round_caps),
+            put(&self.rounding, i.rounding, 1.),
+            flag(&self.ring, i.ring),
         ];
         if let Some([r, g, b]) = rgb {
             self.color
@@ -911,13 +1052,6 @@ impl Inspector {
         }
         self.style.set_visible(shown.contains(&true));
 
-        let flag = |(field, check): &(Field, gtk::CheckButton), v: Value<bool>| {
-            if field.show(&v) {
-                check.set_inconsistent(v.is_mixed());
-                check.set_active(v.first().unwrap_or(false));
-            }
-            !matches!(v, Value::Absent)
-        };
         let shown = [
             put(&self.font, i.font, 1.),
             put(&self.box_width, i.box_width, 1.),
@@ -925,7 +1059,18 @@ impl Inspector {
             flag(&self.italic, i.italic),
             flag(&self.background, i.background),
             self.align.0.show(&i.align),
+            self.family.0.show(&i.family),
+            self.effect.0.show(&i.effect),
         ];
+        self.family
+            .1
+            .set_selected(i.family.text().map_or(gtk::INVALID_LIST_POSITION, |f| {
+                family_position(&self.families, f)
+            }));
+        self.effect.1.set_selected(match i.effect {
+            Value::Same(e) => TextEffect::ALL.iter().position(|x| *x == e).unwrap_or(0) as u32,
+            _ => gtk::INVALID_LIST_POSITION,
+        });
         self.align.1.set_selected(match i.align {
             Value::Same(TextAlign::Left) => 0,
             Value::Same(TextAlign::Center) => 1,
@@ -1098,5 +1243,124 @@ mod tests {
         assert!(
             matches!(Inspection::of(&d, &[1, 2]).rotation, Value::Same(r) if (r - 30.).abs() < 0.05)
         );
+    }
+
+    #[test]
+    fn shape_font_effect_and_ring_fields_follow_the_selected_kinds() {
+        let mut d = doc();
+        let rect = Mark::path(
+            1,
+            vec![pt(10., 10.), pt(60., 10.), pt(60., 40.), pt(10., 40.)],
+            true,
+            [1., 0., 0., 1.],
+            2.,
+        );
+        d.add(rect);
+        d.add(Mark::path(
+            2,
+            vec![pt(0., 90.), pt(40., 90.)],
+            false,
+            [1., 0., 0., 1.],
+            2.,
+        ));
+        d.add(Mark::path(
+            3,
+            vec![pt(80., 10.), pt(100., 10.), pt(90., 30.)],
+            true,
+            [1., 0., 0., 1.],
+            2.,
+        ));
+        d.add(Mark::text(4, pt(20., 120.), "T", [1., 0., 0., 1.], 4.));
+        d.add(Mark::step(5, pt(150., 50.), 1, [1., 0., 0., 1.], 4.));
+        d.add(Mark::highlighter(
+            6,
+            vec![pt(0., 150.), pt(50., 150.)],
+            [1., 1., 0., 0.4],
+            12.,
+        ));
+        let edit = |d: &mut Document, ids: &[u64], e: MarkEdit| assert!(d.edit_marks(ids, &e));
+
+        let none = Inspection::of(&d, &[4]);
+        assert_eq!(
+            (none.fill, none.rounding, none.ring, none.round_caps),
+            (Value::Absent, Value::Absent, Value::Absent, Value::Absent)
+        );
+        assert_eq!(
+            Inspection::of(&d, &[2]).fill,
+            Value::Absent,
+            "open ink has no interior"
+        );
+        assert_eq!(
+            Inspection::of(&d, &[3]).rounding,
+            Value::Absent,
+            "a triangle is not a rectangle"
+        );
+        assert_eq!(Inspection::of(&d, &[6]).round_caps, Value::Same(true));
+        assert_eq!(Inspection::of(&d, &[6]).stroke, Value::Same(12.));
+
+        edit(
+            &mut d,
+            &[1],
+            MarkEdit {
+                fill: Some(true),
+                corner_radius: Some(6.),
+                ..MarkEdit::default()
+            },
+        );
+        let i = Inspection::of(&d, &[1, 3]);
+        assert_eq!(i.fill, Value::Mixed(true));
+        assert_eq!(
+            i.rounding,
+            Value::Same(6.),
+            "only the rectangle reports a radius"
+        );
+        edit(
+            &mut d,
+            &[1, 2],
+            MarkEdit {
+                round_caps: Some(false),
+                ..MarkEdit::default()
+            },
+        );
+        assert_eq!(Inspection::of(&d, &[1, 2]).round_caps, Value::Same(false));
+
+        edit(
+            &mut d,
+            &[4, 5],
+            MarkEdit {
+                font_family: Some("Serif".into()),
+                text_effect: Some(TextEffect::Shadow),
+                step_ring: Some(true),
+                ..MarkEdit::default()
+            },
+        );
+        let i = Inspection::of(&d, &[4, 5]);
+        assert_eq!(i.family.text(), Some("Serif"));
+        assert_eq!(
+            (i.effect, i.ring),
+            (Value::Same(TextEffect::Shadow), Value::Same(true))
+        );
+        edit(
+            &mut d,
+            &[5],
+            MarkEdit {
+                font_family: Some("Monospace".into()),
+                ..MarkEdit::default()
+            },
+        );
+        let i = Inspection::of(&d, &[4, 5]);
+        assert!(matches!(i.family, Value::Mixed(_)) && i.family.text().is_some());
+        assert_eq!(Inspection::of(&d, &[1]).family, Value::Absent);
+
+        // A decimal line width is read back as typed.
+        edit(
+            &mut d,
+            &[2],
+            MarkEdit {
+                width: Some(0.1),
+                ..MarkEdit::default()
+            },
+        );
+        assert_eq!(Inspection::of(&d, &[2]).stroke, Value::Same(0.1));
     }
 }

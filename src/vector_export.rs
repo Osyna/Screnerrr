@@ -19,7 +19,9 @@
 //!
 //! No `.sharp` bytes or metadata are written: only the page itself.
 
-use crate::document::{Bounds, Crop, Document, Mark, MarkKind, PrivacySnapshot};
+use crate::document::{
+    Bounds, Crop, DEFAULT_FAMILY, DEFAULT_FONT_STYLE, Document, Mark, MarkKind, PrivacySnapshot,
+};
 use crate::presentation::Presentation;
 use crate::project::Snapshot;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -118,6 +120,7 @@ fn classify(scene: &Document, privacy: &PrivacySnapshot, m: &Mark, crop: Crop) -
             | MarkKind::Connector { .. }
             | MarkKind::Step { .. }
             | MarkKind::Highlight
+            | MarkKind::Highlighter
     ) {
         return Class::Raster;
     }
@@ -125,14 +128,21 @@ fn classify(scene: &Document, privacy: &PrivacySnapshot, m: &Mark, crop: Crop) -
         return Class::Raster;
     };
     // Generous slack for stroke caps, glyph overhang and Pango differing between surfaces; being
-    // wrong here only turns a vector mark into raster, never the other way.
+    // wrong here only turns a vector mark into raster, never the other way. A mitred corner
+    // reaches a whole line width, and an installed font may overhang its logical box by more than
+    // the default sans does, so both get their own room.
     let scale = m.transform.det().abs().sqrt().max(1.0);
-    let glyphs = if matches!(m.kind, MarkKind::Text { .. }) {
-        m.font_size / 2.0
-    } else {
-        0.0
+    let stroke = if m.round_caps { m.width } else { 2.0 * m.width };
+    let glyphs = match m.kind {
+        MarkKind::Text { .. }
+            if m.font_family == DEFAULT_FAMILY && m.font_style == DEFAULT_FONT_STYLE =>
+        {
+            m.font_size / 2.0
+        }
+        MarkKind::Text { .. } => m.font_size,
+        _ => 0.0,
     };
-    let pad = (2.0 + (m.width + glyphs) * scale) as f32;
+    let pad = (2.0 + (stroke + glyphs) * scale) as f32;
     let e = Bounds {
         x: b.x - pad,
         y: b.y - pad,
@@ -814,6 +824,87 @@ mod tests {
                     .unwrap_or_else(|| panic!("{format:?}: no canvas-sized raster"))
             };
             assert_eq!(shot(&hid), shot(&base), "{format:?}");
+        }
+    }
+
+    /// Every new drawing style shifted by `(dx, dy)`: filled rounded flat-ended rectangle,
+    /// freehand highlighter, block highlight and a shadowed caption in a custom font family.
+    fn styled(dx: f32, dy: f32) -> Vec<Mark> {
+        let mut filled = Mark::path(
+            2,
+            vec![
+                pt(6. + dx, 6. + dy),
+                pt(26. + dx, 6. + dy),
+                pt(26. + dx, 14. + dy),
+                pt(6. + dx, 14. + dy),
+            ],
+            true,
+            RED,
+            2.0,
+        );
+        (filled.fill, filled.corner_radius, filled.round_caps) = (true, 3.0, false);
+        let mut text = small_text(5, pt(5. + dx, 5. + dy), "SEC");
+        text.font_family = "Monospace, Serif".into();
+        text.text_effect = crate::document::TextEffect::Shadow;
+        vec![
+            filled,
+            Mark::highlighter(
+                3,
+                vec![pt(8. + dx, 10. + dy), pt(24. + dx, 10. + dy)],
+                [1., 1., 0., 0.4],
+                6.0,
+            ),
+            Mark::highlight(
+                4,
+                pt(5. + dx, 5. + dy),
+                pt(24. + dx, 15. + dy),
+                [1., 1., 0., 0.3],
+            ),
+            text,
+        ]
+    }
+
+    #[test]
+    fn new_styles_under_a_mask_never_reach_the_vector_file_but_clear_of_it_they_do() {
+        // Small enough that the shifted marks' padded bounds (the text's reach is 11 px plus a
+        // 1 px shadow) stay clear of the mask's one pixel of privacy slack, yet every unshifted
+        // mark still overlaps it.
+        let mask = || Mark::redaction(1, pt(4., 4.), pt(14., 10.));
+        let with = |dx: f32, dy: f32| {
+            let mut marks = vec![mask()];
+            marks.extend(styled(dx, dy));
+            plain(marks)
+        };
+        let baseline = plain(vec![mask()]);
+        assert!(
+            vector_ids(&with(0., 0.)).is_empty(),
+            "masked styles stay raster"
+        );
+        assert_eq!(
+            vector_ids(&with(28., 20.)),
+            [2, 3, 4, 5],
+            "clear styles are vector"
+        );
+        for format in BOTH {
+            let (_, base) = export(&baseline, format);
+            let (_, hid) = export(&with(0., 0.), format);
+            let (_, vis) = export(&with(28., 20.), format);
+            assert_eq!(
+                (hid.paths, hid.glyphs),
+                (base.paths, base.glyphs),
+                "{format:?}: nothing under the mask is emitted"
+            );
+            assert!(
+                vis.paths > base.paths && vis.glyphs > base.glyphs,
+                "{format:?}: the control must show vector marks, or the test proves nothing"
+            );
+            for image in hid.images.iter().filter(|r| (r.w, r.h) == (64, 48)) {
+                for y in 4..10 {
+                    for x in 4..14 {
+                        assert_eq!(image.at(x, y), [0, 0, 0], "{format:?} pixel {x},{y}");
+                    }
+                }
+            }
         }
     }
 

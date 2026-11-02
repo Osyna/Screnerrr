@@ -11,7 +11,10 @@
 use crate::{
     chrome::{self, Icon},
     designer::{caption, named},
-    document::{Crop, Document, MAX_MARKS, MAX_TEXT, MIN_BOX_WIDTH, Mark, MarkKind},
+    document::{
+        Crop, Document, MAX_MARKS, MAX_TEXT, MIN_BOX_WIDTH, Mark, MarkKind, valid_family,
+        valid_font_style,
+    },
     interaction::State,
     presentation::Presentation,
     presets::{self, confirm, private_dir, read_bounded, write_private},
@@ -444,6 +447,8 @@ fn draft_of(state: &State) -> Option<(Mark, u64)> {
         && (*box_width == 0.0 || (box_width.is_finite() && *box_width >= MIN_BOX_WIDTH))
         && mark.font_size.is_finite()
         && mark.font_size >= 1.0
+        && valid_family(&mark.font_family)
+        && valid_font_style(&mark.font_style)
         && mark
             .points
             .iter()
@@ -458,6 +463,9 @@ fn draft_of(state: &State) -> Option<(Mark, u64)> {
     (d.box_width.to_bits(), d.background, d.font_size.to_bits()).hash(&mut h);
     (d.text_style.bold, d.text_style.italic).hash(&mut h);
     std::mem::discriminant(&d.text_style.align).hash(&mut h);
+    d.font_family.hash(&mut h);
+    d.font_style.hash(&mut h);
+    (d.text_effect as u8).hash(&mut h);
     // A new caption takes the current colour and width.
     state.color.map(f64::to_bits).hash(&mut h);
     state.width.to_bits().hash(&mut h);
@@ -1524,7 +1532,11 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{document::TextStyle, interaction::TextDraft, shapes::Point};
+    use crate::{
+        document::{TextEffect, TextStyle},
+        interaction::TextDraft,
+        shapes::Point,
+    };
 
     fn entry(pid: u32, start: u64, ms: u64, bytes: u64) -> Entry {
         Entry {
@@ -1684,6 +1696,9 @@ mod tests {
             background: false,
             font_size: 20.0,
             text_style: TextStyle::default(),
+            font_family: "Sans".into(),
+            font_style: "Regular".into(),
+            text_effect: TextEffect::None,
         }
     }
 
@@ -1728,6 +1743,13 @@ mod tests {
             .unwrap();
         assert!(again.image.is_none());
         assert_ne!(again.key, save.key, "typing changes the signature");
+
+        state.text_draft.as_mut().unwrap().font_family = "Serif, Sans".into();
+        let styled = capture(&state, Some(again.key), baseline, 0, 24, false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(styled.key, again.key, "a font change is an unsaved change");
+        assert_eq!(styled.marks[0].font_family, "Serif, Sans");
 
         state.text_draft = None;
         state.doc.add(text_mark(1));

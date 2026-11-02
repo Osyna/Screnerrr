@@ -1,9 +1,13 @@
+#[path = "editor_actions.rs"]
+mod actions;
+
 use crate::{
     chrome::{self, Icon},
     context_menu::ContextMenu,
-    document::{Document, MarkKind, save_new_png},
+    document::{Document, MarkKind},
     interaction::{self, Gesture, State, Tool, Transform},
     project::Snapshot,
+    settings::{Action, Settings, Trigger},
     shapes::{Point, Recognition, Recognizer},
 };
 use anyhow::Result;
@@ -15,6 +19,7 @@ use gtk::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     rc::Rc,
     sync::mpsc,
@@ -95,19 +100,23 @@ const TOOLS: &[(Tool, Icon, &str, &str)] = &[
         "H · Drag a clear zone with a rounded border; dim the rest of the image.",
     ),
     (
+        Tool::Highlight,
+        Icon::Highlight,
+        "Block highlighter",
+        "G · Drag a translucent rectangle. Ctrl swaps highlighter mode; Alt centres, Shift constrains.",
+    ),
+    (
+        Tool::Highlighter,
+        Icon::Highlighter,
+        "Freehand highlighter",
+        "Shift+G · Paint a translucent stroke. Ctrl swaps mode; Shift draws a 15° aligned segment.",
+    ),
+    (
         Tool::Crop,
         Icon::Crop,
         "Crop",
         "C · Drag the export region. Reset crop restores the full screenshot.",
     ),
-];
-const PALETTE: &[(&str, [u8; 3])] = &[
-    ("Orange", [245, 155, 52]),
-    ("Red", [244, 83, 96]),
-    ("Green", [121, 197, 84]),
-    ("Teal", [54, 198, 202]),
-    ("Violet", [169, 135, 237]),
-    ("White", [243, 246, 247]),
 ];
 const ACCENT: [f64; 3] = [0.388, 0.867, 0.835];
 
@@ -137,6 +146,23 @@ struct SceneCache {
 }
 
 struct View {
+    state: Rc<RefCell<State>>,
+    settings: Rc<Settings>,
+    window: glib::WeakRef<gtk::ApplicationWindow>,
+    commands: RefCell<HashMap<&'static str, gtk::Button>>,
+    tools: Vec<(Tool, gtk::ToggleButton)>,
+    bindings: Vec<(gdk::Key, gdk::ModifierType, String)>,
+    toolbars: Vec<gtk::Widget>,
+    chrome_visible: Cell<bool>,
+    actions: RefCell<VecDeque<Action>>,
+    last_saved: RefCell<Option<PathBuf>>,
+    auto_revision: Cell<u64>,
+    auto_source: RefCell<Option<glib::SourceId>>,
+    auto_pending: Cell<bool>,
+    exported_revision: Cell<Option<u64>>,
+    fill: gtk::ToggleButton,
+    round_caps: gtk::ToggleButton,
+    corner_radius: gtk::SpinButton,
     area: gtk::DrawingArea,
     menu: ContextMenu,
     scene: gtk::DrawingArea,
@@ -153,7 +179,7 @@ struct View {
     color: gtk::ColorButton,
     width: gtk::SpinButton,
     opacity: gtk::Scale,
-    swatches: Vec<(gtk::ToggleButton, [u8; 3])>,
+    swatches: Vec<(gtk::ToggleButton, [f64; 4], bool)>,
     presets: Vec<(gtk::ToggleButton, f64)>,
     dimensions: gtk::Label,
     zoom_label: gtk::Label,
@@ -182,7 +208,7 @@ struct View {
     ocr: Rc<crate::ocr_ui::OcrUi>,
 }
 impl View {
-    fn refresh(&self, state: &State) {
+    fn refresh(self: &Rc<Self>, state: &State) {
         self.menu.popdown();
         let editing = state.text_draft.is_some();
         self.undo.set_sensitive(state.doc.can_undo() && !editing);
@@ -272,6 +298,10 @@ impl View {
                 };
                 button.set_child(Some(&chrome::icon(icon)));
                 button.set_tooltip_text(Some(&format!("Replace with {} · undoable", shape.kind)));
+                button.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "Replace with {}",
+                    shape.kind
+                ))]);
             }
         }
         self.keep_ink.set_visible(correction.is_some());
@@ -293,15 +323,46 @@ impl View {
         self.width.set_value(width);
         self.opacity.set_value(color[3] * 100.);
         self.width.set_sensitive(!text && state.tool != Tool::Text);
+        self.fill.set_active(state.fill());
+        self.round_caps.set_active(state.round_caps());
+        self.corner_radius.set_value(state.corner_radius());
+        self.fill.set_sensitive(
+            !editing
+                && (matches!(state.tool, Tool::Smart | Tool::Rectangle | Tool::Ellipse)
+                    || state
+                        .selected
+                        .iter()
+                        .any(|id| state.doc.mark(*id).is_some_and(|m| m.fillable()))),
+        );
+        self.round_caps.set_sensitive(
+            !editing
+                && (matches!(
+                    state.tool,
+                    Tool::Smart | Tool::Ink | Tool::Arrow | Tool::Line | Tool::Highlighter
+                ) || state
+                    .selected
+                    .iter()
+                    .any(|id| state.doc.mark(*id).is_some_and(|m| m.stroked()))),
+        );
+        self.corner_radius.set_sensitive(
+            !editing
+                && (state.tool == Tool::Rectangle
+                    || state
+                        .selected
+                        .iter()
+                        .any(|id| state.doc.mark(*id).is_some_and(|m| m.is_rectangle()))),
+        );
         let redaction = state
             .selected
             .iter()
             .any(|id| state.doc.mark(*id).is_some_and(|m| m.is_redaction()));
         self.color.set_sensitive(!redaction && !editing);
         self.opacity.set_sensitive(!redaction && !editing);
-        for (button, rgb) in &self.swatches {
+        for (button, rgb, alpha) in &self.swatches {
             button.set_sensitive(!redaction && !editing);
-            button.set_active((0..3).all(|i| (color[i] - f64::from(rgb[i]) / 255.).abs() < 0.005));
+            button.set_active(
+                (0..if *alpha { 4 } else { 3 }).all(|i| (color[i] - rgb[i]).abs() < 0.005),
+            );
         }
         for (button, value) in &self.presets {
             button.set_sensitive(!editing && !text);
@@ -324,6 +385,7 @@ impl View {
             .set_sensitive(state.text_draft.is_none());
         self.caption.sync(state);
         self.refresh_scene(state);
+        self.schedule_auto(state);
     }
     fn refresh_scene(&self, state: &State) {
         let dynamic = dynamic_scene(state);
@@ -340,40 +402,50 @@ impl View {
         action: RenderAction,
     ) {
         if state.text_draft.is_some() {
-            self.help
-                .set_text("Apply or cancel the caption before rendering.");
+            self.actions.borrow_mut().clear();
+            self.error("Apply or cancel the caption before rendering.");
             return;
         }
         if self.rendering.replace(true) {
-            self.help.set_text("An image operation is already running.");
+            self.error("An image operation is already running.");
             return;
         }
+        let revision = state.doc.revision();
+        let automatic = matches!(&action, RenderAction::AutoCopy);
+        let trigger = match &action {
+            RenderAction::Copy => Some(Trigger::Copy),
+            RenderAction::Png(_, trigger) => Some(*trigger),
+            _ => None,
+        };
         let snapshot = match Snapshot::capture(&state.doc) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.rendering.set(false);
-                self.help
-                    .set_text(&format!("Cannot prepare image: {error:#}"));
+                self.actions.borrow_mut().clear();
+                self.error(&format!("Cannot prepare image: {error:#}"));
                 return;
             }
         };
-        let clipboard_watch = matches!(action, RenderAction::Copy).then(|| {
-            let clipboard = window.clipboard();
-            let changed = Rc::new(Cell::new(false));
-            let signal = clipboard.connect_changed(glib::clone!(
-                #[strong]
-                changed,
-                move |_| changed.set(true)
-            ));
-            let request = COPY_REQUEST.with(|current| {
-                let request = current.get().wrapping_add(1);
-                current.set(request);
-                request
+        let clipboard_watch =
+            matches!(&action, RenderAction::Copy | RenderAction::AutoCopy).then(|| {
+                let clipboard = window.clipboard();
+                let changed = Rc::new(Cell::new(false));
+                let signal = clipboard.connect_changed(glib::clone!(
+                    #[strong]
+                    changed,
+                    move |_| changed.set(true)
+                ));
+                let request = COPY_REQUEST.with(|current| {
+                    let request = current.get().wrapping_add(1);
+                    current.set(request);
+                    request
+                });
+                (clipboard, signal, changed, request)
             });
-            (clipboard, signal, changed, request)
-        });
         let hold = window.application().map(|app| app.hold());
-        self.help.set_text("Rendering image…");
+        if !automatic {
+            self.help.set_text("Rendering image…");
+        }
         let view = Rc::downgrade(self);
         let window = window.downgrade();
         glib::spawn_future_local(async move {
@@ -384,14 +456,43 @@ impl View {
                     clipboard.disconnect(signal);
                     !changed.get() && COPY_REQUEST.with(|current| current.get() == request)
                 });
-            let Some(view) = view.upgrade() else { return };
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let Some(window) = window.upgrade().filter(|w| w.is_visible()) else {
+                view.rendering.set(false);
+                view.actions.borrow_mut().clear();
+                return;
+            };
+            let mut success = false;
+            let mut durable = false;
+            let mut notice = None;
+            let mut thumbnail = None;
             match result {
-                Ok(Ok(RenderedOutput::Copy(_))) if !copy_current => view
-                    .help
-                    .set_text("Copy skipped: a newer clipboard action took precedence."),
+                Ok(Ok(RenderedOutput::Copy(_)))
+                    if !copy_current || view.state.borrow().doc.revision() != revision =>
+                {
+                    view.help.set_text(
+                        "Copy skipped: the image or clipboard changed while rendering. Copy again.",
+                    );
+                }
                 Ok(Ok(RenderedOutput::Copy(image))) => {
-                    if let Some(window) = window.upgrade().filter(|w| w.is_visible()) {
-                        let (w, h) = image.dimensions();
+                    if !automatic
+                        && !view.settings.disable_notifications
+                        && view.settings.notification_thumbnail
+                    {
+                        thumbnail = crate::workflow::thumbnail(&image).ok();
+                    }
+                    let (w, h) = image.dimensions();
+                    if let Some(command) = view.settings.copy_command.as_deref() {
+                        match crate::workflow::copy_command(image, command).await {
+                            Ok(()) => {
+                                success = true;
+                                durable = true;
+                            }
+                            Err(error) => view.error(&format!("Cannot copy: {error:#}")),
+                        }
+                    } else {
                         let bytes = glib::Bytes::from_owned(image.into_raw());
                         let texture = gdk::MemoryTexture::new(
                             w as i32,
@@ -402,34 +503,73 @@ impl View {
                         );
                         let clipboard = window.clipboard();
                         clipboard.set_texture(&texture);
-                        clipboard.store_async(
-                            glib::Priority::DEFAULT,
-                            None::<&gio::Cancellable>,
-                            |_| {},
+                        if !automatic && view.copy_must_persist() {
+                            match crate::workflow::store_clipboard(&clipboard).await {
+                                Ok(()) => {
+                                    success = true;
+                                    durable = true;
+                                }
+                                Err(error) => view
+                                    .error(&format!("Image copied, but exit cancelled: {error:#}")),
+                            }
+                        } else {
+                            clipboard.store_async(
+                                glib::Priority::DEFAULT,
+                                None::<&gio::Cancellable>,
+                                |_| {},
+                            );
+                            success = true;
+                        }
+                    }
+                    if success && !automatic {
+                        let text = format!(
+                            "Copied {w} × {h} · Keep this window open until you paste if no clipboard manager is running."
                         );
-                        view.help.set_text(&format!("Copied {w} × {h} · Keep this window open until you paste if no clipboard manager is running."));
+                        view.help.set_text(&text);
+                        notice = Some(text);
                     }
                 }
                 Ok(Ok(RenderedOutput::Pin(image))) => {
-                    if let Some(window) = window.upgrade().filter(|w| w.is_visible()) {
-                        view.help.set_text("Pinning screenshot…");
-                        match crate::pin::show(&window, image).await {
-                            Ok(()) => view.help.set_text("Reference pinned · Use Hide or show pins to recover click-through controls."),
-                            Err(error) => view.help.set_text(&format!("Cannot pin: {error:#}")),
+                    view.help.set_text("Pinning screenshot…");
+                    match crate::pin::show(&window, image).await {
+                        Ok(()) => {
+                            view.help.set_text("Reference pinned · Use Hide or show pins to recover click-through controls.");
+                            success = true;
                         }
+                        Err(error) => view.error(&format!("Cannot pin: {error:#}")),
                     }
                 }
-                Ok(Ok(RenderedOutput::Saved(path))) => {
-                    view.help.set_text(&format!("Saved {}", path.display()))
+                Ok(Ok(RenderedOutput::Saved(path, image))) => {
+                    if !view.settings.disable_notifications && view.settings.notification_thumbnail
+                    {
+                        thumbnail = crate::workflow::thumbnail(&image).ok();
+                    }
+                    let text = if path.as_os_str() == "-" {
+                        "PNG written to stdout".into()
+                    } else {
+                        format!("Saved {}", path.display())
+                    };
+                    view.saved_path(path);
+                    view.help.set_text(&text);
+                    notice = Some(text);
+                    success = true;
+                    durable = true;
                 }
-                Ok(Err(error)) => view
-                    .help
-                    .set_text(&format!("Image operation failed: {error:#}")),
-                Err(_) => view.help.set_text(
+                Ok(Err(error)) => view.error(&format!("Image operation failed: {error:#}")),
+                Err(_) => view.error(
                     "Image worker failed. The previous clipboard and document are unchanged.",
                 ),
             }
+            if success
+                && !view.settings.disable_notifications
+                && let Some(text) = notice
+            {
+                if let Some(app) = window.application() {
+                    crate::workflow::notify(&app, &text, thumbnail);
+                }
+            }
             view.rendering.set(false);
+            view.complete_action(&window, success, trigger, revision, durable);
         });
     }
     fn refresh_cursor(&self, state: &State) {
@@ -521,24 +661,25 @@ enum Inference {
 
 enum RenderAction {
     Copy,
+    AutoCopy,
     Pin,
-    Png(PathBuf),
+    Png(PathBuf, Trigger),
 }
 
 enum RenderedOutput {
     Copy(image::RgbaImage),
     Pin(image::RgbaImage),
-    Saved(PathBuf),
+    Saved(PathBuf, image::RgbaImage),
 }
 
 fn render_snapshot(snapshot: Snapshot, action: RenderAction) -> Result<RenderedOutput> {
     let image = snapshot.into_document()?.render()?;
     match action {
-        RenderAction::Copy => Ok(RenderedOutput::Copy(image)),
+        RenderAction::Copy | RenderAction::AutoCopy => Ok(RenderedOutput::Copy(image)),
         RenderAction::Pin => Ok(RenderedOutput::Pin(image)),
-        RenderAction::Png(path) => {
-            save_new_png(&image, &path)?;
-            Ok(RenderedOutput::Saved(path))
+        RenderAction::Png(path, _) => {
+            crate::workflow::save(&image, &path)?;
+            Ok(RenderedOutput::Saved(path, image))
         }
     }
 }
@@ -595,28 +736,64 @@ fn menu_button(menu: &ContextMenu, icon: Icon, name: &str, button: &gtk::Button)
     }
 }
 
-fn select_all_objects(state: &mut State, view: &View) {
+fn select_all_objects(state: &mut State, view: &Rc<View>) {
     state.cancel();
     state.selected = state.doc.marks.iter().map(|m| m.id).collect();
     view.refresh(state);
 }
 
-pub fn run(doc: Document) -> Result<()> {
+pub fn run(doc: Document, settings: Settings) -> Result<()> {
+    settings.validate()?;
+    let stylesheet = settings.read_stylesheet()?;
+    let style_error = Rc::new(RefCell::new(None));
+    let activation_error = style_error.clone();
+    let settings = Rc::new(settings);
     let app = gtk::Application::builder()
-        .application_id("io.github.sharpshot.SharpShot")
+        .application_id(&settings.app_id)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
     let initial = RefCell::new(Some(doc));
     app.connect_activate(move |app| {
         if let Some(doc) = initial.borrow_mut().take() {
             chrome::install();
-            build(app, doc);
+            if let Some(css) = &stylesheet {
+                if let Err(error) = install_stylesheet(css) {
+                    *activation_error.borrow_mut() = Some(error);
+                    app.quit();
+                    return;
+                }
+            }
+            build(app, doc, settings.clone());
         }
     });
     let code = app.run_with_args::<&str>(&[]);
+    if let Some(error) = style_error.borrow_mut().take() {
+        return Err(error);
+    }
     if code != glib::ExitCode::SUCCESS {
         anyhow::bail!("GTK exited with {code:?}");
     }
+    Ok(())
+}
+fn install_stylesheet(css: &str) -> Result<()> {
+    let display = gdk::Display::default()
+        .ok_or_else(|| anyhow::anyhow!("No display for the custom stylesheet"))?;
+    let provider = gtk::CssProvider::new();
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    provider.connect_parsing_error(glib::clone!(
+        #[strong]
+        errors,
+        move |_, _, error| errors.borrow_mut().push(error.to_string())
+    ));
+    provider.load_from_data(css);
+    if !errors.borrow().is_empty() {
+        anyhow::bail!("Custom stylesheet: {}", errors.borrow().join("; "));
+    }
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 2,
+    );
     Ok(())
 }
 fn separator(row: &gtk::Box) {
@@ -657,7 +834,8 @@ fn zoom(state: &mut State, view: &View, value: Option<f64>, at: Option<(f64, f64
     view.area.queue_draw();
 }
 
-fn build(app: &gtk::Application, doc: Document) {
+fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
+    let startup = std::time::Instant::now();
     let (request, requests) = mpsc::channel::<(u64, Vec<Point>)>();
     let (result, results) = async_channel::unbounded();
     std::thread::spawn(move || {
@@ -681,6 +859,32 @@ fn build(app: &gtk::Application, doc: Document) {
         }
     });
     let state = Rc::new(RefCell::new(State::new(doc, request)));
+    {
+        let mut s = state.borrow_mut();
+        s.fill = settings.default_fill;
+        s.round_caps = settings.default_round_caps;
+        s.corner_radius = settings.corner_radius;
+        s.width = (4. * settings.annotation_size_factor)
+            .clamp(crate::document::MIN_WIDTH, crate::document::MAX_WIDTH);
+        s.head_size = settings
+            .annotation_size_factor
+            .clamp(0., crate::document::MAX_HEAD_SIZE);
+        s.text_size = (24. * settings.annotation_size_factor).clamp(1., crate::document::MAX_FONT);
+        s.brush_smoothing = settings.brush_smoothing;
+        s.font_family = std::iter::once(settings.font_family.as_str())
+            .chain(settings.font_fallback.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.font_style.clone_from(&settings.font_style);
+        s.text_style = crate::document::font_style_defaults(&settings.font_style);
+        if let Some(color) = settings
+            .palette
+            .first()
+            .and_then(|c| crate::settings::parse_color(c).ok())
+        {
+            s.color = color;
+        }
+    }
     let view_slot = Rc::new(RefCell::new(std::rc::Weak::<View>::new()));
     let refresh: Rc<dyn Fn()> = {
         let slot = view_slot.clone();
@@ -696,12 +900,15 @@ fn build(app: &gtk::Application, doc: Document) {
     inspector.widget.set_hexpand(false);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .title("SharpShot — Annotate")
-        .default_width(1280)
-        .default_height(850)
+        .title(&settings.title)
+        .default_width(settings.width.unwrap_or(1280))
+        .default_height(settings.height.unwrap_or(850))
         .build();
     window.add_css_class("sharpshot");
     window.set_size_request(760, 440);
+    if settings.floating {
+        window.set_resizable(false);
+    }
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = gtk::HeaderBar::new();
     let undo = chrome::button(Icon::Undo, "Undo", "Undo · Ctrl+Z");
@@ -742,9 +949,11 @@ fn build(app: &gtk::Application, doc: Document) {
         if tool == Tool::Smart || tool == Tool::Crop {
             separator(&tools);
         }
+        let (shortcut, hint) = tip.split_once('·').unwrap_or(("", tip));
+        let shortcut = actions::tool_shortcut(&settings, tool, shortcut.trim());
         let button = gtk::ToggleButton::builder()
             .child(&chrome::icon(icon))
-            .tooltip_text(format!("{name} · {tip}"))
+            .tooltip_text(format!("{name} · {shortcut} · {}", hint.trim()))
             .build();
         button.add_css_class("tool-button");
         button.update_property(&[gtk::accessible::Property::Label(name)]);
@@ -797,28 +1006,54 @@ fn build(app: &gtk::Application, doc: Document) {
         "P  Freehand    A  Arrow    L  Line    R  Rectangle",
         "E  Ellipse      T  Text      C  Crop",
         "B  Privacy zone    N  Numbered step    M  Magnifier    H  Spotlight",
+        "G  Primary highlighter    Shift+G  Other highlighter    Ctrl-drag  Swap style",
+        "F  Toggle fill    K  Round line ends    Alt+1…0  Palette / custom color",
+        "Alt-drag shapes  Draw from center    Shift  Square / circle",
+        "Shift while highlighting  Straight 15° segments    Alt on a step  Extra ring",
         "Shift-click / marquee  Multi-select    Ctrl+A  Select all",
         "Handles  Resize / rotate    Shift  Proportions / 15° rotation",
         "Alt while dragging  Disable magnetic guides",
         "Ctrl+G  Group    Ctrl+Shift+G  Ungroup    Ctrl+D  Duplicate",
         "Ctrl+Home  Bring to front    Ctrl+End  Send to back",
         "Text: Enter  Apply    Shift+Enter  New line    Esc  Cancel",
+        "Text: Alt  Cycle effect    Ctrl+Alt+arrows  Move caption    Shift  10×",
         "Ctrl+O  Open project    Ctrl+Shift+S  Save editable project",
         "Arrows  Nudge 1 px    Shift+arrows 10 px",
         "Delete  Remove selection    Esc  Cancel / deselect",
         "Ctrl+Z  Undo    Ctrl+Shift+Z  Redo",
         "0  Fit image    1  Actual pixels    Wheel  Zoom at cursor",
         "Middle-button drag  Pan the canvas",
+        "Touchpad  Pan    Ctrl+touchpad / pinch  Zoom    Alt+arrows  Pan",
         "Right-click / Menu / Shift+F10  Context actions",
         "F8  OCR text layer    Ctrl+C  Copy image / recognised text    Ctrl+S  Export PNG",
         "Ctrl+K  Command palette    Ctrl+I  Object inspector",
+        "Enter  Copy image    Ctrl+Alt+S  Save PNG as…    Ctrl+Alt+C  Copy saved path",
+        "Ctrl+T  Toggle toolbars    F11  Fullscreen    Ctrl+Q  Close screenshot",
+        "Ctrl+Shift+Delete  Clear all annotations (undoable)",
         "While editing text: Ctrl+B Bold    Ctrl+I Italic",
     ] {
         let label = gtk::Label::new(Some(text));
         label.set_xalign(0.);
         legend.append(&label);
     }
-    popover.set_child(Some(&legend));
+    if !settings.keybinds.is_empty() {
+        legend.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let note = gtk::Label::new(Some("Configured shortcuts replace the defaults above:"));
+        note.set_xalign(0.);
+        legend.append(&note);
+        for (command, accelerator) in &settings.keybinds {
+            let label = gtk::Label::new(Some(&format!("{accelerator}  ·  {command}")));
+            label.set_xalign(0.);
+            legend.append(&label);
+        }
+    }
+    let shortcuts_scroll = gtk::ScrolledWindow::builder()
+        .child(&legend)
+        .max_content_height(600)
+        .propagate_natural_height(true)
+        .propagate_natural_width(true)
+        .build();
+    popover.set_child(Some(&shortcuts_scroll));
     help_button.set_popover(Some(&popover));
     let project_button = gtk::MenuButton::builder()
         .child(&chrome::icon(Icon::Project))
@@ -878,6 +1113,36 @@ fn build(app: &gtk::Application, doc: Document) {
         "Export PDF",
         "Privacy-safe single-page PDF with sanitised image assets",
     );
+    let save_as = more(
+        Icon::Save,
+        "Save PNG as…",
+        "Always choose a PNG filename · Ctrl+Alt+S",
+    );
+    let copy_path = more(
+        Icon::Copy,
+        "Copy saved file path",
+        "Copy the last saved PNG path · Ctrl+Alt+C",
+    );
+    let toolbar_toggle = more(
+        Icon::Toolbars,
+        "Show or hide toolbars",
+        "Toggle all toolbars · Ctrl+T",
+    );
+    let fullscreen_toggle = more(
+        Icon::Fullscreen,
+        "Toggle fullscreen",
+        "Enter or leave fullscreen · F11",
+    );
+    let clear_all = more(
+        Icon::Delete,
+        "Clear annotations",
+        "Remove all annotations, including privacy masks · Undoable · Ctrl+Shift+Delete",
+    );
+    let quit = more(
+        Icon::Close,
+        "Close screenshot",
+        "Close this editor · Ctrl+Q · Unsaved work is confirmed",
+    );
     let project_warning = gtk::Label::new(Some(
         "Projects contain the ORIGINAL screenshot,\nincluding redacted pixels. Share PNG instead.",
     ));
@@ -891,7 +1156,13 @@ fn build(app: &gtk::Application, doc: Document) {
     header.pack_end(&copy);
     header.pack_end(&designer);
     header.pack_end(&resize);
-    window.set_titlebar(Some(&header));
+    if settings.no_window_decoration {
+        window.set_decorated(false);
+        header.set_show_title_buttons(false);
+        root.prepend(&header);
+    } else {
+        window.set_titlebar(Some(&header));
+    }
     let area = gtk::DrawingArea::builder()
         .hexpand(true)
         .vexpand(true)
@@ -921,8 +1192,19 @@ fn build(app: &gtk::Application, doc: Document) {
     let scroll = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
+        .kinetic_scrolling(false)
         .child(&viewport)
         .build();
+    // GTK's wheel inertia is separate from the touch kinetic-scrolling setting.
+    for controller in scroll
+        .observe_controllers()
+        .iter::<glib::Object>()
+        .flatten()
+    {
+        if let Ok(controller) = controller.downcast::<gtk::EventControllerScroll>() {
+            controller.set_flags(controller.flags() & !gtk::EventControllerScrollFlags::KINETIC);
+        }
+    }
     scroll.add_css_class("canvas");
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     body.set_vexpand(true);
@@ -1009,24 +1291,36 @@ fn build(app: &gtk::Application, doc: Document) {
     styles.add_css_class("style-bar");
     styles.set_halign(gtk::Align::Center);
     let mut swatches = vec![];
-    for &(name, rgb) in PALETTE {
+    for (index, name) in settings
+        .palette
+        .iter()
+        .chain(&settings.custom_colors)
+        .enumerate()
+    {
+        let rgb = crate::settings::parse_color(name).expect("validated annotation palette");
         let paint = gtk::DrawingArea::builder()
             .content_width(18)
             .content_height(18)
             .can_target(false)
             .build();
         paint.set_draw_func(move |_, cr, _, _| {
-            cr.set_source_rgb(
-                f64::from(rgb[0]) / 255.,
-                f64::from(rgb[1]) / 255.,
-                f64::from(rgb[2]) / 255.,
-            );
+            cr.set_source_rgba(rgb[0], rgb[1], rgb[2], rgb[3]);
             cr.rectangle(1., 1., 16., 16.);
             let _ = cr.fill();
         });
         let button = gtk::ToggleButton::builder()
             .child(&paint)
-            .tooltip_text(format!("{name} annotation color"))
+            .tooltip_text(if index < 10 {
+                let command = format!("color-{}", index + 1);
+                let shortcut = settings
+                    .keybinds
+                    .get(&command)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Alt+{}", (index + 1) % 10));
+                format!("{name} annotation color · {shortcut}")
+            } else {
+                format!("{name} annotation color")
+            })
             .build();
         button.add_css_class("tool-button");
         button.add_css_class("swatch");
@@ -1034,7 +1328,7 @@ fn build(app: &gtk::Application, doc: Document) {
             "{name} annotation color"
         ))]);
         styles.append(&button);
-        swatches.push((button, rgb));
+        swatches.push((button, rgb, name.len() == 9));
     }
     let color = gtk::ColorButton::new();
     color.set_title("Annotation color");
@@ -1042,6 +1336,25 @@ fn build(app: &gtk::Application, doc: Document) {
     color.set_tooltip_text(Some("Custom color and opacity"));
     color.update_property(&[gtk::accessible::Property::Label("Custom annotation color")]);
     styles.append(&color);
+    let fill = gtk::ToggleButton::builder()
+        .child(&chrome::icon(Icon::Fill))
+        .tooltip_text("Fill shapes · F · Transparent shapes remain click-through")
+        .css_classes(["tool-button"])
+        .build();
+    fill.update_property(&[gtk::accessible::Property::Label("Fill shapes")]);
+    styles.append(&fill);
+    let round_caps = gtk::ToggleButton::builder()
+        .child(&chrome::icon(Icon::RoundCaps))
+        .tooltip_text("Round line ends · K")
+        .css_classes(["tool-button"])
+        .build();
+    round_caps.update_property(&[gtk::accessible::Property::Label("Round line ends")]);
+    styles.append(&round_caps);
+    let corner_radius = gtk::SpinButton::with_range(0., crate::document::MAX_RADIUS, 1.);
+    corner_radius.set_width_chars(3);
+    corner_radius.set_tooltip_text(Some("Rectangle corner radius in image pixels"));
+    corner_radius.update_property(&[gtk::accessible::Property::Label("Rectangle corner radius")]);
+    styles.append(&corner_radius);
     separator(&styles);
     let mut presets = vec![];
     for (name, value) in [("S", 2.), ("M", 4.), ("L", 8.)] {
@@ -1055,10 +1368,12 @@ fn build(app: &gtk::Application, doc: Document) {
         styles.append(&button);
         presets.push((button, value));
     }
-    let width = gtk::SpinButton::with_range(1., 128., 1.);
-    width.set_width_chars(2);
+    let width =
+        gtk::SpinButton::with_range(crate::document::MIN_WIDTH, crate::document::MAX_WIDTH, 0.1);
+    width.set_digits(2);
+    width.set_width_chars(4);
     width.set_tooltip_text(Some(
-        "Line thickness in image pixels · Text has its own font-size control",
+        "Line thickness in image pixels · Wheel or arrows: 0.1 px, Shift: 0.01 px, Ctrl: 1 px · Text has its own font size",
     ));
     width.update_property(&[gtk::accessible::Property::Label("Stroke width in pixels")]);
     styles.append(&width);
@@ -1110,7 +1425,8 @@ fn build(app: &gtk::Application, doc: Document) {
     help.set_xalign(0.);
     help.set_ellipsize(gtk::pango::EllipsizeMode::End);
     status.append(&help);
-    let credit = gtk::Label::new(Some("Powered by Desert Ant Labs"));
+    let credit = gtk::Label::new(None);
+    credit.set_markup("<a href=\"https://desertant.com\">Powered by Desert Ant Labs</a>");
     status.append(&credit);
     root.append(&status);
     let ocr = crate::ocr_ui::OcrUi::new(&area, state.clone(), &help, refresh.clone());
@@ -1119,6 +1435,35 @@ fn build(app: &gtk::Application, doc: Document) {
     window.set_child(Some(&root));
     let menu = ContextMenu::new(&area);
     let view = Rc::new(View {
+        state: state.clone(),
+        settings: settings.clone(),
+        window: window.downgrade(),
+        commands: RefCell::new(HashMap::new()),
+        tools: tool_buttons.clone(),
+        bindings: settings
+            .keybinds
+            .iter()
+            .filter_map(|(name, value)| {
+                crate::settings::parse_accelerator(value)
+                    .map(|(key, mods)| (key, mods, name.clone()))
+            })
+            .collect(),
+        toolbars: vec![
+            header.clone().upcast(),
+            context_scroll.clone().upcast(),
+            style_scroll.clone().upcast(),
+            status.clone().upcast(),
+        ],
+        chrome_visible: Cell::new(true),
+        actions: RefCell::new(VecDeque::new()),
+        last_saved: RefCell::new(None),
+        auto_revision: Cell::new(state.borrow().doc.revision()),
+        auto_source: RefCell::new(None),
+        auto_pending: Cell::new(false),
+        exported_revision: Cell::new(None),
+        fill,
+        round_caps,
+        corner_radius,
         area,
         menu,
         scene,
@@ -1164,6 +1509,191 @@ fn build(app: &gtk::Application, doc: Document) {
     });
     *view_slot.borrow_mut() = Rc::downgrade(&view);
     view.refresh(&state.borrow());
+    {
+        let mut commands = view.commands.borrow_mut();
+        for (name, button) in [
+            ("copy", &copy),
+            ("save", &export),
+            ("save-as", &save_as),
+            ("copy-path", &copy_path),
+            ("undo", &view.undo),
+            ("redo", &view.redo),
+            ("toolbar", &toolbar_toggle),
+            ("fullscreen", &fullscreen_toggle),
+            ("fit", &fit),
+            ("open-project", &open_project),
+            ("save-project", &save_project),
+            ("zoom-in", &plus),
+            ("zoom-out", &minus),
+            ("delete", &view.delete),
+            ("group", &view.group),
+            ("ungroup", &view.ungroup),
+            ("duplicate", &view.duplicate),
+            ("front", &view.front),
+            ("back", &view.back),
+            ("clear", &clear_all),
+            ("quit", &quit),
+            ("palette", &palette_button),
+        ] {
+            commands.insert(name, button.clone());
+        }
+        commands.insert("fill", view.fill.clone().upcast());
+        commands.insert("round-caps", view.round_caps.clone().upcast());
+        commands.insert("inspector", inspector_button.clone().upcast());
+        commands.insert("ocr", view.ocr.toggle.clone().upcast());
+    }
+    for (command, button) in view.commands.borrow().iter() {
+        if let Some(shortcut) = settings.keybinds.get(*command) {
+            let tip = button.tooltip_text();
+            let name = tip
+                .as_deref()
+                .and_then(|tip| tip.split(" · ").next())
+                .unwrap_or(command);
+            button.set_tooltip_text(Some(&format!("{name} · {shortcut}")));
+        }
+    }
+    save_as.connect_clicked(glib::clone!(
+        #[weak]
+        view,
+        move |_| view.save(true)
+    ));
+    copy_path.connect_clicked(glib::clone!(
+        #[weak]
+        view,
+        move |_| {
+            view.copy_path();
+        }
+    ));
+    toolbar_toggle.connect_clicked(glib::clone!(
+        #[weak]
+        view,
+        move |_| view.set_toolbars(!view.chrome_visible.get())
+    ));
+    fullscreen_toggle.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        move |_| {
+            if window.is_fullscreen() {
+                window.unfullscreen();
+            } else {
+                window.fullscreen();
+            }
+        }
+    ));
+    quit.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        move |_| window.close()
+    ));
+    clear_all.connect_clicked(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        view,
+        move |_| {
+            let mut s = state.borrow_mut();
+            if s.text_draft.is_some() {
+                view.error("Apply or cancel the caption before clearing annotations.");
+                return;
+            }
+            s.cancel();
+            let ids: Vec<_> = s.doc.marks.iter().map(|m| m.id).collect();
+            s.doc.remove_many(&ids);
+            s.selected.clear();
+            view.refresh(&s);
+        }
+    ));
+    view.fill.connect_toggled(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        view,
+        move |button| {
+            if view.syncing.get() {
+                return;
+            }
+            let mut s = state.borrow_mut();
+            s.set_fill(button.is_active());
+            view.refresh(&s);
+        }
+    ));
+    view.round_caps.connect_toggled(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        view,
+        move |button| {
+            if view.syncing.get() {
+                return;
+            }
+            let mut s = state.borrow_mut();
+            s.set_round_caps(button.is_active());
+            view.refresh(&s);
+        }
+    ));
+    view.corner_radius.connect_value_changed(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        view,
+        move |spin| {
+            if view.syncing.get() {
+                return;
+            }
+            let mut s = state.borrow_mut();
+            s.set_corner_radius(spin.value());
+            view.refresh(&s);
+        }
+    ));
+    view.width.adjustment().set_page_increment(1.);
+    let width_scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    width_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    width_scroll.connect_scroll(glib::clone!(
+        #[weak]
+        view,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |controller, _, dy| {
+            let modifiers = controller.current_event_state();
+            let step = if modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                1.
+            } else if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                0.01
+            } else {
+                0.1
+            };
+            view.width.set_value(view.width.value() - dy * step);
+            glib::Propagation::Stop
+        }
+    ));
+    view.width.add_controller(width_scroll);
+    let width_keys = gtk::EventControllerKey::new();
+    width_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    width_keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        view,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, modifiers| {
+            let direction = match key {
+                gdk::Key::Up | gdk::Key::Page_Up => 1.,
+                gdk::Key::Down | gdk::Key::Page_Down => -1.,
+                _ => return glib::Propagation::Proceed,
+            };
+            let step = if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+                || matches!(key, gdk::Key::Page_Up | gdk::Key::Page_Down)
+            {
+                1.
+            } else if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                0.01
+            } else {
+                0.1
+            };
+            view.width.set_value(view.width.value() + direction * step);
+            glib::Propagation::Stop
+        }
+    ));
+    view.width.add_controller(width_keys);
     inspector_button.connect_toggled(glib::clone!(
         #[strong]
         state,
@@ -1194,7 +1724,9 @@ fn build(app: &gtk::Application, doc: Document) {
     recovery.set_on_restore(Rc::new(glib::clone!(
         #[weak]
         app,
-        move |doc| build(&app, doc)
+        #[strong]
+        settings,
+        move |doc| build(&app, doc, settings.clone())
     )));
     recovery_button.connect_clicked(glib::clone!(
         #[strong]
@@ -1292,48 +1824,88 @@ fn build(app: &gtk::Application, doc: Document) {
         ));
     }
     let mut commands = Vec::new();
-    for ((_, _, name, tip), (_, button)) in TOOLS.iter().zip(&tool_buttons) {
+    let shortcut_for = |command: &str, fallback: &str| {
+        settings
+            .keybinds
+            .get(command)
+            .cloned()
+            .unwrap_or_else(|| fallback.into())
+    };
+    for ((tool, _, name, tip), (_, button)) in TOOLS.iter().zip(&tool_buttons) {
         commands.push(crate::palette::Command {
             name: (*name).into(),
-            shortcut: tip.split('·').next().unwrap_or("").trim().into(),
-            description: (*tip).into(),
+            shortcut: actions::tool_shortcut(
+                &settings,
+                *tool,
+                tip.split('·').next().unwrap_or("").trim(),
+            )
+            .into(),
+            description: button
+                .tooltip_text()
+                .map_or(String::new(), |tip| tip.to_string()),
             widget: button.clone().upcast(),
         });
     }
-    for (name, shortcut, button) in [
-        ("Undo", "Ctrl+Z", &view.undo),
-        ("Redo", "Ctrl+Shift+Z", &view.redo),
-        ("Delete selection", "Delete", &view.delete),
-        ("Group", "Ctrl+G", &view.group),
-        ("Ungroup", "Ctrl+Shift+G", &view.ungroup),
-        ("Duplicate", "Ctrl+D", &view.duplicate),
-        ("Bring to front", "Ctrl+Home", &view.front),
-        ("Send to back", "Ctrl+End", &view.back),
-        ("Edit text", "Double-click", &view.edit_text),
-        ("Earlier step", "", &view.earlier),
-        ("Later step", "", &view.later),
-        ("Copy image", "Ctrl+C", &copy),
-        ("Export PNG", "Ctrl+S", &export),
-        ("Export SVG", "", &export_svg),
-        ("Export PDF", "", &export_pdf),
-        ("Screenshot designer", "", &designer),
-        ("Crop and resize", "", &resize),
-        ("Reset crop", "", &view.reset_crop),
-        ("Open project", "Ctrl+O", &open_project),
-        ("Save project", "Ctrl+Shift+S", &save_project),
-        ("Saved styles", "", &style_presets),
-        ("Autosave and recovery", "", &recovery_button),
-        ("Smart redaction", "", &smart_redact),
-        ("Pin screenshot", "", &pin_button),
-        ("Hide or show pins", "", &toggle_pins),
-        ("Scrolling capture", "", &scroll_capture),
-        ("Fit image", "0", &fit),
-        ("Zoom in", "Ctrl+plus", &plus),
-        ("Zoom out", "Ctrl+minus", &minus),
+    for (name, command, shortcut, button) in [
+        ("Undo", "undo", "Ctrl+Z", &view.undo),
+        ("Redo", "redo", "Ctrl+Shift+Z", &view.redo),
+        ("Delete selection", "delete", "Delete", &view.delete),
+        ("Group", "group", "Ctrl+G", &view.group),
+        ("Ungroup", "ungroup", "Ctrl+Shift+G", &view.ungroup),
+        ("Duplicate", "duplicate", "Ctrl+D", &view.duplicate),
+        ("Bring to front", "front", "Ctrl+Home", &view.front),
+        ("Send to back", "back", "Ctrl+End", &view.back),
+        ("Edit text", "", "Double-click", &view.edit_text),
+        ("Earlier step", "", "", &view.earlier),
+        ("Later step", "", "", &view.later),
+        ("Copy image", "copy", "Ctrl+C", &copy),
+        ("Export PNG", "save", "Ctrl+S", &export),
+        ("Save PNG as…", "save-as", "Ctrl+Alt+S", &save_as),
+        (
+            "Copy saved file path",
+            "copy-path",
+            "Ctrl+Alt+C",
+            &copy_path,
+        ),
+        (
+            "Show or hide toolbars",
+            "toolbar",
+            "Ctrl+T",
+            &toolbar_toggle,
+        ),
+        ("Toggle fullscreen", "fullscreen", "F11", &fullscreen_toggle),
+        (
+            "Clear annotations",
+            "clear",
+            "Ctrl+Shift+Delete",
+            &clear_all,
+        ),
+        ("Close screenshot", "quit", "Ctrl+Q", &quit),
+        ("Export SVG", "", "", &export_svg),
+        ("Export PDF", "", "", &export_pdf),
+        ("Screenshot designer", "", "", &designer),
+        ("Crop and resize", "", "", &resize),
+        ("Reset crop", "", "", &view.reset_crop),
+        ("Open project", "open-project", "Ctrl+O", &open_project),
+        (
+            "Save project",
+            "save-project",
+            "Ctrl+Shift+S",
+            &save_project,
+        ),
+        ("Saved styles", "", "", &style_presets),
+        ("Autosave and recovery", "", "", &recovery_button),
+        ("Smart redaction", "", "", &smart_redact),
+        ("Pin screenshot", "", "", &pin_button),
+        ("Hide or show pins", "", "", &toggle_pins),
+        ("Scrolling capture", "", "", &scroll_capture),
+        ("Fit image", "fit", "0", &fit),
+        ("Zoom in", "zoom-in", "Ctrl+plus", &plus),
+        ("Zoom out", "zoom-out", "Ctrl+minus", &minus),
     ] {
         commands.push(crate::palette::Command {
             name: name.into(),
-            shortcut: shortcut.into(),
+            shortcut: shortcut_for(command, shortcut),
             description: button
                 .tooltip_text()
                 .map_or(String::new(), |s| s.to_string()),
@@ -1342,16 +1914,29 @@ fn build(app: &gtk::Application, doc: Document) {
     }
     commands.push(crate::palette::Command {
         name: "Object inspector".into(),
-        shortcut: "Ctrl+I".into(),
+        shortcut: shortcut_for("inspector", "Ctrl+I"),
         description: "Precise geometry, appearance, alignment and distribution".into(),
         widget: inspector_button.clone().upcast(),
     });
     commands.push(crate::palette::Command {
         name: "Recognise text".into(),
-        shortcut: "F8".into(),
+        shortcut: shortcut_for("ocr", "F8"),
         description: "Selectable OCR text layer and markup".into(),
         widget: view.ocr.toggle.clone().upcast(),
     });
+    for (name, command, shortcut, button) in [
+        ("Fill shapes", "fill", "F", &view.fill),
+        ("Round line ends", "round-caps", "K", &view.round_caps),
+    ] {
+        commands.push(crate::palette::Command {
+            name: name.into(),
+            shortcut: shortcut_for(command, shortcut),
+            description: button
+                .tooltip_text()
+                .map_or(String::new(), |s| s.to_string()),
+            widget: button.clone().upcast(),
+        });
+    }
     let palette = crate::palette::Palette::new(&window, commands);
     palette_button.connect_clicked(glib::clone!(
         #[strong]
@@ -1702,6 +2287,61 @@ fn build(app: &gtk::Application, doc: Document) {
                     menu_button(menu, Icon::Delete, "Delete", &view.delete);
                 }
             }
+            menu.separator();
+            menu.action(
+                Icon::Toolbars,
+                if view.chrome_visible.get() {
+                    "Hide toolbars"
+                } else {
+                    "Show toolbars"
+                },
+                glib::clone!(
+                    #[weak]
+                    view,
+                    move || {
+                        view.invoke("toolbar");
+                    }
+                ),
+            );
+            menu.action(
+                Icon::Fullscreen,
+                if window.is_fullscreen() {
+                    "Leave fullscreen"
+                } else {
+                    "Enter fullscreen"
+                },
+                glib::clone!(
+                    #[weak]
+                    view,
+                    move || {
+                        view.invoke("fullscreen");
+                    }
+                ),
+            );
+            if state.borrow().text_draft.is_none() && !view.rendering.get() {
+                menu.action(
+                    Icon::Save,
+                    "Save PNG as…",
+                    glib::clone!(
+                        #[weak]
+                        view,
+                        move || view.save(true)
+                    ),
+                );
+                if view.last_saved.borrow().is_some() {
+                    menu.action(
+                        Icon::Copy,
+                        "Copy saved file path",
+                        glib::clone!(
+                            #[weak]
+                            view,
+                            move || {
+                                view.copy_path();
+                            }
+                        ),
+                    );
+                }
+            }
             menu.popup(
                 at.0.clamp(h.value(), h.value() + h.page_size().max(1.) - 1.),
                 at.1.clamp(v.value(), v.value() + v.page_size().max(1.) - 1.),
@@ -1714,9 +2354,24 @@ fn build(app: &gtk::Application, doc: Document) {
     secondary.connect_pressed(glib::clone!(
         #[strong]
         open_context,
+        #[weak]
+        view,
         move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            open_context(Some((x, y)));
+            if view.state.borrow().tool == Tool::Crop
+                && gesture
+                    .current_event_state()
+                    .contains(gdk::ModifierType::CONTROL_MASK)
+            {
+                let mut state = view.state.borrow_mut();
+                state.cancel();
+                state.doc.set_crop(None);
+                view.refresh(&state);
+            } else if !view.settings.on_right_click.is_empty() {
+                view.queue_actions(&view.settings.on_right_click);
+            } else {
+                open_context(Some((x, y)));
+            }
         }
     ));
     view.area.add_controller(secondary);
@@ -2061,8 +2716,9 @@ fn build(app: &gtk::Application, doc: Document) {
             }
         ));
     }
-    for (button, rgb) in &view.swatches {
+    for (button, rgb, alpha) in &view.swatches {
         let rgb = *rgb;
+        let alpha = *alpha;
         button.connect_clicked(glib::clone!(
             #[strong]
             state,
@@ -2073,7 +2729,11 @@ fn build(app: &gtk::Application, doc: Document) {
                     return;
                 }
                 let mut state = state.borrow_mut();
-                state.set_rgb(rgb.map(|v| f64::from(v) / 255.));
+                if alpha {
+                    state.set_style(Some(rgb), None);
+                } else {
+                    state.set_rgb([rgb[0], rgb[1], rgb[2]]);
+                }
                 view.refresh(&state);
             }
         ));
@@ -2170,7 +2830,14 @@ fn build(app: &gtk::Application, doc: Document) {
             let shift = controller
                 .current_event_state()
                 .contains(gdk::ModifierType::SHIFT_MASK);
-            if let Some(message) = state.begin(x, y, shift) {
+            let modifiers = controller.current_event_state();
+            if let Some(message) = state.begin(
+                x,
+                y,
+                shift,
+                modifiers.contains(gdk::ModifierType::ALT_MASK),
+                modifiers.contains(gdk::ModifierType::CONTROL_MASK),
+            ) {
                 view.help.set_text(message);
             }
             view.refresh(&state);
@@ -2434,9 +3101,7 @@ fn build(app: &gtk::Application, doc: Document) {
             }
         ));
     }
-    let wheel = gtk::EventControllerScroll::new(
-        gtk::EventControllerScrollFlags::VERTICAL | gtk::EventControllerScrollFlags::DISCRETE,
-    );
+    let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     wheel.connect_scroll(glib::clone!(
         #[strong]
         state,
@@ -2444,28 +3109,90 @@ fn build(app: &gtk::Application, doc: Document) {
         view,
         #[upgrade_or]
         glib::Propagation::Proceed,
-        move |controller, _, dy| {
-            if dy == 0.
-                || controller.current_event_state().intersects(
-                    gdk::ModifierType::SHIFT_MASK
-                        | gdk::ModifierType::ALT_MASK
-                        | gdk::ModifierType::SUPER_MASK,
-                )
+        move |controller, dx, dy| {
+            if view.menu.is_open()
+                || view.panning.get().is_some()
+                || state.borrow().gesture.is_some()
             {
+                return glib::Propagation::Stop;
+            }
+            let modifiers = controller.current_event_state();
+            if modifiers.intersects(
+                gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SUPER_MASK,
+            ) {
+                return glib::Propagation::Proceed;
+            }
+            let smooth = controller.unit() == gdk::ScrollUnit::Surface;
+            if smooth && !modifiers.contains(gdk::ModifierType::CONTROL_MASK) {
+                view.scroll_by(dx, dy);
+                return glib::Propagation::Stop;
+            }
+            if dy == 0. {
                 return glib::Propagation::Proceed;
             }
             let Some(at) = view.pointer.get() else {
                 return glib::Propagation::Proceed;
             };
             let mut state = state.borrow_mut();
-            let z =
-                (state.zoom.unwrap_or(state.transform.scale) * 1.25_f64.powf(-dy)).clamp(0.1, 4.);
-            zoom(&mut state, &view, Some(z), Some(at));
-            view.refresh(&state);
+            let factor = if smooth { 1.0025_f64 } else { 1.25_f64 };
+            let z = (state.zoom.unwrap_or(state.transform.scale) * factor.powf(-dy)).clamp(0.1, 4.);
+            if state.zoom != Some(z) {
+                zoom(&mut state, &view, Some(z), Some(at));
+                view.refresh(&state);
+            }
             glib::Propagation::Stop
         }
     ));
     view.area.add_controller(wheel);
+    let pinch = gtk::GestureZoom::new();
+    let pinch_start = Rc::new(Cell::new(1.));
+    pinch.connect_begin(glib::clone!(
+        #[strong]
+        state,
+        #[strong]
+        pinch_start,
+        #[weak]
+        view,
+        move |gesture, _| {
+            if view.menu.is_open() {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let mut state = state.borrow_mut();
+            state.cancel();
+            pinch_start.set(state.zoom.unwrap_or(state.transform.scale));
+        }
+    ));
+    pinch.connect_scale_changed(glib::clone!(
+        #[strong]
+        state,
+        #[strong]
+        pinch_start,
+        #[weak]
+        view,
+        move |gesture, scale| {
+            if !scale.is_finite() || scale <= 0. {
+                return;
+            }
+            let Some((x, y)) = gesture.bounding_box_center() else {
+                return;
+            };
+            let at = (
+                x - view.scroll.hadjustment().value(),
+                y - view.scroll.vadjustment().value(),
+            );
+            let mut state = state.borrow_mut();
+            let z = (pinch_start.get() * scale).clamp(0.1, 4.);
+            if state.zoom != Some(z) {
+                zoom(&mut state, &view, Some(z), Some(at));
+                view.refresh(&state);
+            }
+        }
+    ));
+    view.area.add_controller(pinch);
 
     copy.connect_clicked(glib::clone!(
         #[strong]
@@ -2477,57 +3204,9 @@ fn build(app: &gtk::Application, doc: Document) {
         move |_| view.render_image(&state.borrow(), &window, RenderAction::Copy)
     ));
     export.connect_clicked(glib::clone!(
-        #[strong]
-        state,
         #[weak]
         view,
-        #[weak]
-        window,
-        move |_| {
-            if state.borrow().text_draft.is_some() {
-                view.help
-                    .set_text("Apply or cancel the caption before exporting.");
-                return;
-            }
-            let dialog = gtk::FileChooserNative::new(
-                Some("Export PNG"),
-                Some(&window),
-                gtk::FileChooserAction::Save,
-                Some("Export"),
-                Some("Cancel"),
-            );
-            let seconds = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            dialog.set_current_name(&format!("SharpShot-{seconds}.png"));
-            let filter = gtk::FileFilter::new();
-            filter.set_name(Some("PNG image"));
-            filter.add_pattern("*.png");
-            dialog.add_filter(&filter);
-            let state = state.clone();
-            let weak_view = Rc::downgrade(&view);
-            let weak_window = window.downgrade();
-            glib::spawn_future_local(async move {
-                let response = dialog.run_future().await;
-                let path = dialog.file().and_then(|file| file.path());
-                dialog.destroy();
-                if response != gtk::ResponseType::Accept {
-                    return;
-                }
-                let Some(view) = weak_view.upgrade() else {
-                    return;
-                };
-                let Some(path) = path else {
-                    view.help
-                        .set_text("Choose a local folder to export the PNG.");
-                    return;
-                };
-                if let Some(window) = weak_window.upgrade() {
-                    view.render_image(&state.borrow(), &window, RenderAction::Png(path));
-                }
-            });
-        }
+        move |_| view.save(false)
     ));
     let click_away = gtk::GestureClick::new();
     click_away.set_button(1);
@@ -2569,234 +3248,62 @@ fn build(app: &gtk::Application, doc: Document) {
 
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let alt_tap = Rc::new(Cell::new(false));
     keys.connect_key_pressed(glib::clone!(
-        #[strong]
-        state,
         #[weak]
         view,
         #[weak]
-        window,
-        #[weak]
-        copy,
-        #[weak]
-        export,
-        #[weak]
-        fit,
-        #[weak]
-        plus,
-        #[weak]
-        minus,
-        #[weak]
         help_button,
-        #[weak]
-        save_project,
-        #[weak]
-        open_project,
-        #[strong]
-        palette,
-        #[weak]
-        inspector_button,
-        #[strong]
-        tool_buttons,
         #[strong]
         open_context,
+        #[strong]
+        alt_tap,
         #[upgrade_or]
         glib::Propagation::Proceed,
         move |_, key, _, modifiers| {
             if view.menu.is_open() {
                 return glib::Propagation::Proceed;
             }
-            let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
-            let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
-            if ctrl
-                && matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
-                && state.borrow().text_draft.is_some()
-            {
-                view.caption.apply.emit_clicked();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::k {
-                palette.open();
-                return glib::Propagation::Stop;
-            }
-            if key == gdk::Key::Escape {
-                if view.panning.take().is_some() {
-                    view.end_pan(&state.borrow());
-                    return glib::Propagation::Stop;
-                }
-                if view.ocr.enabled() {
-                    view.ocr.cancel();
-                    return glib::Propagation::Stop;
-                }
-                let mut state = state.borrow_mut();
-                let drawing = state.gesture.is_some();
-                state.cancel();
-                state.text_draft = None;
-                state.magnifier_source = None;
-                view.caption.close();
-                if !drawing {
-                    state.selected.clear();
-                }
-                view.refresh(&state);
-                drop(state);
-                if !drawing {
-                    tool_buttons[0].1.set_active(true);
-                }
-                view.area.grab_focus();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::i && state.borrow().text_draft.is_none() {
-                inspector_button.set_active(!inspector_button.is_active());
-                return glib::Propagation::Stop;
-            }
-            if gtk::prelude::RootExt::focus(&window).is_some_and(|focus| {
-                focus.is::<gtk::Text>()
-                    || focus.is::<gtk::Entry>()
-                    || focus.is::<gtk::TextView>()
-                    || focus.is::<gtk::SpinButton>()
-                    || focus.is::<gtk::Scale>()
-            }) {
+            if matches!(key, gdk::Key::Alt_L | gdk::Key::Alt_R) {
+                let state = view.state.borrow();
+                alt_tap.set(state.text_draft.is_some() || state.tool == Tool::Text);
                 return glib::Propagation::Proceed;
             }
-            if key == gdk::Key::Menu || (shift && key == gdk::Key::F10) {
-                open_context(None);
+            alt_tap.set(false);
+            if view.key(key, modifiers) {
                 return glib::Propagation::Stop;
             }
-            if key == gdk::Key::F8 {
-                view.ocr.toggle();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::a && view.ocr.enabled() {
-                view.ocr.select_all();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::s {
-                if shift {
-                    save_project.emit_clicked();
-                } else {
-                    export.emit_clicked();
-                }
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::o {
-                open_project.emit_clicked();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::a {
-                let mut s = state.borrow_mut();
-                select_all_objects(&mut s, &view);
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::g {
-                if shift {
-                    view.ungroup.emit_clicked();
-                } else {
-                    view.group.emit_clicked();
-                }
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::d {
-                view.duplicate.emit_clicked();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && (key == gdk::Key::Home || key == gdk::Key::End) {
-                if key == gdk::Key::Home {
-                    view.front.emit_clicked();
-                } else {
-                    view.back.emit_clicked();
-                }
-                return glib::Propagation::Stop;
-            }
-            if key == gdk::Key::question {
-                help_button.popup();
-                return glib::Propagation::Stop;
-            }
-            if ctrl && key.to_lower() == gdk::Key::c && view.ocr.enabled() {
-                view.ocr.copy_text();
-                return glib::Propagation::Stop;
-            }
-            let action = if ctrl {
-                match key.to_lower() {
-                    gdk::Key::z => Some(if shift { &view.redo } else { &view.undo }),
-                    gdk::Key::y => Some(&view.redo),
-                    gdk::Key::c => Some(&copy),
-                    gdk::Key::plus | gdk::Key::equal => Some(&plus),
-                    gdk::Key::minus => Some(&minus),
-                    _ => None,
-                }
-            } else {
-                match key {
-                    gdk::Key::_0 => Some(&fit),
-                    gdk::Key::Delete | gdk::Key::BackSpace => Some(&view.delete),
-                    _ => None,
-                }
-            };
-            if let Some(button) = action {
-                if button.is_sensitive() {
-                    button.emit_clicked();
-                }
-                return glib::Propagation::Stop;
-            }
-            if !ctrl
-                && !modifiers
-                    .intersects(gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK)
-            {
-                if key == gdk::Key::_1 {
-                    let mut state = state.borrow_mut();
-                    zoom(&mut state, &view, Some(1.), None);
-                    view.refresh(&state);
+            if !view.editable_focus() {
+                if key == gdk::Key::Menu
+                    || (modifiers.contains(gdk::ModifierType::SHIFT_MASK) && key == gdk::Key::F10)
+                {
+                    open_context(None);
                     return glib::Propagation::Stop;
                 }
-                let delta = match key {
-                    gdk::Key::Left => Some((-1., 0.)),
-                    gdk::Key::Right => Some((1., 0.)),
-                    gdk::Key::Up => Some((0., -1.)),
-                    gdk::Key::Down => Some((0., 1.)),
-                    _ => None,
-                };
-                if let Some((dx, dy)) = delta {
-                    let mut state = state.borrow_mut();
-                    if state.tool == Tool::Select
-                        && view.area.has_focus()
-                        && state.gesture.is_none()
-                    {
-                        if !state.selected.is_empty() {
-                            let step = if shift { 10. } else { 1. };
-                            let ids = state.selected.clone();
-                            state
-                                .doc
-                                .move_marks(&ids, interaction::pt(dx * step, dy * step));
-                            view.refresh(&state);
-                            return glib::Propagation::Stop;
-                        }
-                    }
-                }
-                let tool = match key.to_lower() {
-                    gdk::Key::v => Some(Tool::Select),
-                    gdk::Key::s => Some(Tool::Smart),
-                    gdk::Key::p => Some(Tool::Ink),
-                    gdk::Key::a => Some(Tool::Arrow),
-                    gdk::Key::l => Some(Tool::Line),
-                    gdk::Key::h => Some(Tool::Spotlight),
-                    gdk::Key::r => Some(Tool::Rectangle),
-                    gdk::Key::e => Some(Tool::Ellipse),
-                    gdk::Key::t => Some(Tool::Text),
-                    gdk::Key::c => Some(Tool::Crop),
-                    gdk::Key::b => Some(Tool::Redact),
-                    gdk::Key::n => Some(Tool::Step),
-                    gdk::Key::m => Some(Tool::Magnify),
-                    _ => None,
-                };
-                if let Some(tool) = tool {
-                    if let Some((_, button)) = tool_buttons.iter().find(|(t, _)| *t == tool) {
-                        if button.is_sensitive() {
-                            button.set_active(true);
-                        }
-                    }
+                if key == gdk::Key::question {
+                    help_button.popup();
                     return glib::Propagation::Stop;
                 }
             }
             glib::Propagation::Proceed
+        }
+    ));
+    keys.connect_key_released(glib::clone!(
+        #[weak]
+        view,
+        #[strong]
+        alt_tap,
+        move |_, key, _, _| {
+            if matches!(key, gdk::Key::Alt_L | gdk::Key::Alt_R) && alt_tap.replace(false) {
+                if view.state.borrow().text_draft.is_some() {
+                    view.caption.cycle_effect();
+                } else {
+                    let mut state = view.state.borrow_mut();
+                    let effect = state.text_effect().next();
+                    state.set_text_effect(effect);
+                    view.refresh(&state);
+                }
+            }
         }
     ));
     window.add_controller(keys);
@@ -2859,7 +3366,71 @@ fn build(app: &gtk::Application, doc: Document) {
             }
         }
     });
+    view.invoke(&settings.initial_tool);
+    view.set_toolbars(!settings.hide_toolbars);
+    if settings.focus_toggle_toolbars {
+        let initial_focus = Cell::new(true);
+        window.connect_is_active_notify(glib::clone!(
+            #[weak]
+            view,
+            move |window| {
+                if initial_focus.replace(false) {
+                    return;
+                }
+                view.set_toolbars(window.is_active());
+            }
+        ));
+    }
+    if settings.profile_startup {
+        let first_map = Cell::new(true);
+        window.connect_map(move |_| {
+            if first_map.replace(false) {
+                eprintln!(
+                    "startup: GTK window mapped in {:.1} ms",
+                    startup.elapsed().as_secs_f64() * 1000.
+                );
+            }
+        });
+    }
     window.present();
+    if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
+        toplevel.set_fullscreen_mode(if settings.fullscreen_mode == "all" {
+            gdk::FullscreenMode::AllMonitors
+        } else {
+            gdk::FullscreenMode::CurrentMonitor
+        });
+    }
+    if settings.fullscreen {
+        window.fullscreen();
+    }
+    if settings.floating {
+        glib::idle_add_local_once(glib::clone!(
+            #[weak]
+            window,
+            move || window.set_resizable(true)
+        ));
+    }
+    let initial_zoom = (settings.zoom_factor / settings.input_scale).clamp(0.1, 4.);
+    if settings.zoom_factor != 1. || settings.input_scale != 1. {
+        view.area.add_tick_callback(glib::clone!(
+            #[weak]
+            view,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move |_, _| {
+                if view.scroll.hadjustment().page_size() <= 0.
+                    || view.scroll.vadjustment().page_size() <= 0.
+                {
+                    return glib::ControlFlow::Continue;
+                }
+                let mut state = view.state.borrow_mut();
+                state.transform = canvas_transform(&state, view.area.width(), view.area.height());
+                zoom(&mut state, &view, Some(initial_zoom), None);
+                view.refresh(&state);
+                glib::ControlFlow::Break
+            }
+        ));
+    }
     view.area.grab_focus();
 }
 
@@ -3182,7 +3753,7 @@ fn open_project_dialog(app: &gtk::Application, window: &gtk::ApplicationWindow, 
             Ok(Ok(snapshot)) => match snapshot.into_document() {
                 Ok(doc) => {
                     if let Some(app) = app.upgrade() {
-                        build(&app, doc);
+                        build(&app, doc, view.settings.clone());
                         view.help.set_text(
                             "Project opened in a new window. This screenshot is unchanged.",
                         );

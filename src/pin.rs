@@ -222,11 +222,6 @@ fn exchange(stream: &UnixStream, header: &str, payload: &[u8]) -> std::io::Resul
     Ok(parse_reply(&String::from_utf8_lossy(&line)))
 }
 
-/// Whether a pin helper is currently running (for enabling a toolbar toggle).
-pub fn active() -> bool {
-    matches!(connect(), Ok(Some(_)))
-}
-
 /// Hides all pins if any is visible, otherwise shows them again with click-through cleared,
 /// so a click-through pin is always recoverable. Used by `--toggle-pins` and the editor.
 pub fn toggle_all() -> Result<()> {
