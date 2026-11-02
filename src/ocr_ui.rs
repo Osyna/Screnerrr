@@ -13,6 +13,7 @@ use crate::{
     document::{Bounds, Crop, Document, Mark, PrivacySnapshot},
     interaction::State,
     ocr::{self, Engine, Page, Pt, Quad},
+    ocr_table::{self, Scene},
     shapes::Point,
     smart_redact::{PAD_X as MASK_PAD_X, PAD_Y as MASK_PAD_Y, Review},
 };
@@ -119,6 +120,8 @@ pub struct OcrUi {
     vis: RefCell<VisCache>,
     /// Smart-redaction review window while one is open.
     review: RefCell<Option<Rc<Review>>>,
+    /// Table preview window while one is open.
+    table: RefCell<Option<glib::WeakRef<gtk::Window>>>,
 }
 
 fn point(p: Pt) -> Point {
@@ -195,6 +198,11 @@ impl OcrUi {
             "Copy recognised text",
             "Copy the selected text, or all recognised text when nothing is selected · Ctrl+C",
         );
+        let table = make(
+            Icon::Table,
+            "Copy as table",
+            "Arrange the recognised text as a table (the selection, or all visible text): preview and adjust the rows and columns, then copy as spreadsheet text, CSV or Markdown",
+        );
         let highlight = make(
             Icon::Highlight,
             "Highlight selected text",
@@ -224,6 +232,7 @@ impl OcrUi {
             toggle: toggle.clone(),
             actions: vec![
                 copy.clone(),
+                table.clone(),
                 highlight.clone(),
                 underline.clone(),
                 strike.clone(),
@@ -234,6 +243,7 @@ impl OcrUi {
             changed,
             vis: RefCell::default(),
             review: RefCell::new(None),
+            table: RefCell::new(None),
         });
         toggle.connect_toggled(glib::clone!(
             #[weak]
@@ -256,6 +266,19 @@ impl OcrUi {
                 move |_| this.markup(kind)
             ));
         }
+        table.connect_clicked(glib::clone!(
+            #[weak]
+            this,
+            move |b| match b
+                .root()
+                .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
+            {
+                Some(window) => this.table_preview(&window),
+                None => this
+                    .help
+                    .set_text("The table view needs the editor window."),
+            }
+        ));
         smart.connect_clicked(glib::clone!(
             #[weak]
             this,
@@ -701,6 +724,48 @@ impl OcrUi {
             if added == 1 { "" } else { "s" }
         ));
         (self.changed)();
+    }
+
+    /// Shows `text` in the editor's status line.
+    pub(crate) fn say(&self, text: &str) {
+        self.help.set_text(text);
+    }
+
+    /// The table words the live document allows right now for the glyph ordinals `range`.
+    pub(crate) fn table_scene(&self, range: (usize, usize)) -> Scene {
+        if self.state.try_borrow().is_err() {
+            return Scene::Busy;
+        }
+        match self.snapshot() {
+            Some((page, vis)) => Scene::Words(ocr_table::words(&page, &vis, range)),
+            None => Scene::Gone,
+        }
+    }
+
+    /// Opens the table preview over `parent` for the selected text, or for all visible text when
+    /// nothing is selected. Nothing is copied until the user asks; the preview closes by itself
+    /// when a mask, crop or new image changes the text it shows.
+    pub fn table_preview(self: &Rc<Self>, parent: &gtk::ApplicationWindow) {
+        let Some((page, vis)) = self.snapshot() else {
+            return self.help.set_text(
+                "Turn on the text layer (F8) and wait for recognition before making a table.",
+            );
+        };
+        let range = live_range(&page, &vis, self.selection.get()).unwrap_or((0, page.len()));
+        let words = ocr_table::words(&page, &vis, range);
+        if words.is_empty() {
+            return self
+                .help
+                .set_text("No visible recognised text to arrange as a table.");
+        }
+        let old = self.table.borrow_mut().take().and_then(|w| w.upgrade());
+        if let Some(old) = old {
+            old.close();
+        }
+        let window = ocr_table::open(self, parent, words, range);
+        *self.table.borrow_mut() = Some(window.downgrade());
+        self.help
+            .set_text("Table preview open · adjust rows and columns, then copy.");
     }
 
     /// Draws the text layer; `cr` is in image coordinates, after the scene.

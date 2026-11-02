@@ -6,6 +6,7 @@ use gtk::{
 #[derive(Clone, Copy)]
 pub enum Icon {
     Select,
+    Eraser,
     Smart,
     Pen,
     Arrow,
@@ -57,6 +58,8 @@ pub enum Icon {
     Search,
     Recovery,
     Scroll,
+    Table,
+    Record,
 }
 
 thread_local! {
@@ -181,6 +184,22 @@ fn paint(kind: Icon, cr: &Context) -> Result<(), gtk::cairo::Error> {
                 ],
             );
         }
+        Icon::Eraser => {
+            path(
+                cr,
+                &[
+                    (3., 11.),
+                    (11., 3.),
+                    (18., 10.),
+                    (11., 17.),
+                    (8., 17.),
+                    (3., 12.),
+                    (3., 11.),
+                ],
+            );
+            path(cr, &[(7., 7.), (14., 14.)]);
+            path(cr, &[(8., 17.), (18., 17.)]);
+        }
         Icon::Smart => {
             path(
                 cr,
@@ -279,6 +298,18 @@ fn paint(kind: Icon, cr: &Context) -> Result<(), gtk::cairo::Error> {
                 cr,
                 &[(2., 16.), (5., 10.), (19., 10.), (16., 17.), (2., 17.)],
             );
+        }
+        Icon::Table => {
+            cr.rectangle(2., 3., 16., 14.);
+            path(cr, &[(2., 8.), (18., 8.)]);
+            path(cr, &[(2., 12.), (18., 12.)]);
+            path(cr, &[(8., 3.), (8., 17.)]);
+        }
+        Icon::Record => {
+            cr.rectangle(2., 4., 12., 12.);
+            path(cr, &[(14., 8.), (19., 5.), (19., 15.), (14., 12.)]);
+            cr.move_to(10., 10.);
+            cr.arc(8., 10., 2., 0., std::f64::consts::TAU);
         }
         Icon::Ocr => {
             path(cr, &[(6., 2.), (2., 2.), (2., 6.)]);

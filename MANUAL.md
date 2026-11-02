@@ -1,19 +1,19 @@
 # SharpShot
 
-A native Rust screenshot editor for Linux, with wlroots Wayland capture, local PaddleOCR and an offline shape helper powered by [Desert Ant Labs Shapes](https://desertant.com/models/shapes/).
+A native Rust screenshot editor for Linux, with direct Wayland or desktop-portal capture, local PaddleOCR and an offline shape helper powered by [Desert Ant Labs Shapes](https://desertant.com/models/shapes/).
 
 Capture a monitor or desktop region, annotate editable vector objects, and copy a PNG or save an editable project. Smart strokes fit to shapes. The inspector edits geometry and mixed selections; text edits directly on the canvas without stretched glyphs. Local PaddleOCR supplies selectable text, markup and reviewed smart redaction. Saved styles, screenshot framing, pinned reference images, scrolling capture and opt-in crash recovery are included.
 
 ## Build
 
-Requires Linux, Rust 1.92+, a C toolchain, pkg-config, GTK 4.8+ and Cairo 1.16+ development libraries. The prebuilt ONNX Runtime used for OCR also requires a modern glibc/libstdc++ toolchain; Arch Linux and Debian 13 are supported build environments. Debian 12's native libraries are too old for this runtime.
+Requires Linux, Rust 1.92+, a C toolchain, pkg-config, GTK 4.8+, Cairo 1.16+ and GStreamer core/app/video development libraries. The prebuilt ONNX Runtime used for OCR also requires a modern glibc/libstdc++ toolchain; Arch Linux and Debian 13 are supported build environments. Debian 12's native libraries are too old for this runtime.
 
 ```sh
 # Arch Linux
-sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp ttf-dejavu
+sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp ttf-dejavu gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav gst-plugin-pipewire ffmpeg pipewire wireplumber xdg-desktop-portal
 
 # Debian 13+: install Rust separately with rustup
-sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp fonts-dejavu-core
+sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp fonts-dejavu-core libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav ffmpeg pipewire wireplumber xdg-desktop-portal
 
 cargo build --release --locked
 ./target/release/sharpshot
@@ -25,7 +25,7 @@ Or install the executable into Cargo's bin directory:
 cargo install --path . --locked
 ```
 
-The Shapes and PP-OCRv5 mobile models are bundled in the executable. No model download, API key, Python, JavaScript, or `grim` is needed at runtime. Interactive `--region` selection uses `slurp`; it returns coordinates only. Full-monitor capture and explicit `--geometry` do not require it.
+The Shapes and PP-OCRv5 mobile models are bundled in the executable. No model download, API key, Python or JavaScript is needed at runtime. Normal `--region` selection uses the built-in precision selector. Guided scrolling still uses `slurp` for logical coordinates unless `--geometry` is supplied. The desktop's portal backend may have its own picker or capture helper.
 
 Shape inference uses Google's native LiteRT CPU runtime through Rust bindings. The first build downloads a checksum-pinned `libLiteRt.so` into the `litert-sys` cache. The executable can find that cache automatically. For an offline build, set `LITERT_LIB_DIR` to a directory containing the compatible library. OCR runs PaddleOCR's detector and recogniser locally through the Rust `ort` binding to statically linked ONNX Runtime; its first build also needs the native runtime download/cache.
 
@@ -58,11 +58,12 @@ sharpshot --project shot.sharp    # reopen an editable project
 sharpshot --scroll --region       # guided vertical scrolling capture, then annotate
 sharpshot --scroll --geometry "100,80 640x480" # fixed scrolling-content region
 sharpshot --toggle-pins           # hide/show reference pins and restore pointer input
+sharpshot --record                # short region recording, preview, trim, GIF/WebM
 ```
 
-Capture uses the compositor's `zwlr_screencopy_manager_v1` protocol directly in Rust. It preserves physical pixel resolution, accounts for row stride and output transforms, and has bounded waits if the compositor stops responding. The screenshot is captured **before** the editor opens, so the editor is not included.
+On wlroots-compatible compositors, capture uses `zwlr_screencopy_manager_v1` directly in Rust. It preserves physical resolution, accounts for row stride and output transforms, and bounds waits if the compositor stops responding. Without that protocol, capture uses the desktop Screenshot portal. Capture happens before the editor opens.
 
-Regions can cross monitors, including negative desktop coordinates. Mixed-DPI captures use the highest participating scale; pixels in monitor gaps or outside the desktop are transparent. Normal outputs copy only the selected intersection. Rotated/flipped outputs capture an upright frame before cropping because older wlroots versions misplace direct region requests. Desktop selection finishes before capture; cancelling never falls back to a fullscreen screenshot.
+Direct `--geometry` regions can cross monitors, including negative coordinates. Mixed-DPI captures use the highest participating scale; gaps or areas outside the desktop remain transparent. Precision selection freezes the whole captured desktop first and crops its pixels afterwards, so neither the selector nor the editor appears in the result. Escape creates no requested output file; portal-owned originals may still exist.
 
 For Lua-based Hyprland configurations:
 
@@ -102,6 +103,31 @@ hl.permission({
 ```
 
 The equivalent `.conf` rule is `permission = ^/usr/local/bin/sharpshot$, screencopy, allow`. Use your real installation path and escape regex metacharacters in it. Hyprland permission-rule changes require a compositor restart, not just a config reload; do not restart an active session solely to run a test.
+
+### Desktop portals and permissions
+
+Install `xdg-desktop-portal` and the backend matching the desktop: `xdg-desktop-portal-gnome`, `xdg-desktop-portal-kde`, or the appropriate wlroots/Hyprland backend. Existing desktop sessions normally provide their own PipeWire and permission services. The system capture dialog chooses the source; `--output`, global `--geometry` and explicit `--cursor` control remain direct-wlroots options.
+
+GNOME 48 reports Escape, denied permission and backend failure identically. When no image is returned, SharpShot exits without a requested output and explains this ambiguity on stderr. GNOME can remember a denied screenshot permission; check desktop permissions if later requests do not show a dialog. KDE can likewise report a backend save failure as cancellation.
+
+**The portal may retain its own screenshot in Pictures/Screenshots, including an uncropped original used by the precision selector. SharpShot reads but does not delete portal-owned files.** This also applies when the user cancels the subsequent precision selection.
+
+### Precision selector
+
+`--region` opens a frozen screenshot with a nearest-pixel 8× loupe, source-pixel coordinates and live dimensions. Drag and release the mouse button to capture immediately; L toggles the loupe. For keyboard-only selection, arrow keys move by one source pixel, Shift multiplies the step by ten, Ctrl+arrows move the right/bottom edge and Alt+arrows move the left/top edge. Enter captures the keyboard selection and Escape cancels. Edges stay within the source, and a one-pixel selection is valid for still images.
+
+The recorder uses the same release-to-select interaction but rejects mouse release, Capture and Enter outside its 16-pixel minimum and 8-megapixel budget. Invalid regions remain selected so they can be corrected without restarting capture.
+
+### Short GIF/WebM recordings
+
+Use `sharpshot --record` or Projects and actions → Record screen region. Recording requires a ScreenCast portal backend, PipeWire, GStreamer PipeWire/base/good/bad/libav plugins, and `ffmpeg` with the VP9 encoder. The preview uses the libav MJPEG decoder to preserve full-chroma colour edges.
+
+Choose a screen or window in the system picker, select a region, then start a 5–30 second recording. Controls hide by default; the timer ends recording, and a desktop sharing indicator may allow early stop. To keep a Stop button, uncheck Hide controls and move the window outside the recorded region. Visible controls can be recorded; SharpShot does not claim compositor-level exclusion.
+
+Play the preview and adjust Start/End by frame. GIF and WebM exports keep the same frame range at 15 fps and never replace an existing destination. There is no audio or editing timeline. Clips use private temporary files, removed when the preview closes; a killed process can leave its temporary directory behind. No live-screen redaction is applied.
+
+Cursor visibility is requested from the portal, not reconstructed from the image. The tested KWin virtual backend embedded its software cursor even when it advertised and received Hidden mode; inspect the preview. Fractional scaling and multi-monitor portal recording have not been exercised.
+
 
 
 ## Configuration and automated workflows
@@ -153,7 +179,7 @@ The timeout stops the direct configured process, not every descendant it may spa
 
 ## Annotate
 
-The top strip contains icon tools with delayed native GTK tooltips and accessible names. Contextual actions appear below the canvas; OCR copy and markup actions appear there only while the text layer is enabled. The bottom strip holds colour, line thickness, opacity, zoom, output dimensions and crop reset. Tool and style strips scroll in narrow windows; `?` opens the shortcut guide.
+The top strip contains icon tools with delayed native GTK tooltips and accessible names. Contextual actions appear below the canvas; OCR copy and markup actions appear there only while the text layer is enabled. The bottom strip holds colour, line thickness, opacity, zoom, output dimensions and crop reset. The top strip uses available width without a scrollbar; in narrow windows, scroll over it or Tab between tools to reveal overflow. The style strip also scrolls; `?` opens the shortcut guide.
 
 The shortcuts below are defaults. A configured binding replaces that command's default.
 
@@ -167,6 +193,7 @@ The shortcuts below are defaults. A configured binding replaces that command's d
 | Bring to front / send to back | Ctrl+Home / Ctrl+End | Reorder the selection, preserving its internal order; also available in the context strip |
 | Nudge selection | Arrow keys / Shift+arrows | Move by 1 / 10 image pixels, independent of zoom |
 | Delete selection | Delete / Backspace | Remove the selection; Undo restores layer order and attachments |
+| Eraser | X | Click or hold left-button drag to delete touched annotations/groups, not background pixels. One Undo restores the stroke. Esc stops and keeps removals. Privacy masks can also be erased. |
 | Smart shape | S | Draw one stroke; release to fit, then pick another shape or Keep original stroke |
 | Freehand | P | Keep the stroke exactly as drawn |
 | Block highlighter | G by default | Drag a translucent rectangle; Ctrl at press swaps to freehand |
@@ -268,6 +295,14 @@ Smart redaction recognises email addresses, phone numbers, IP addresses, IBANs, 
 
 PNG saving runs on a worker, writes a private temporary file in the destination directory, syncs it, and installs it without overwriting an existing file. Choose a new name rather than replacing an existing screenshot. The model runs on a separate worker, and late recognition results remain compatible with undo/redo.
 
+### Copy recognised tables
+
+In OCR mode, select the table's text or leave no selection to use all visible text. Copy as table in the OCR toolbar or context menu opens an inferred grid and exact copy preview. Select a row number or column letter to join/split it; Reset restores the inferred layout. Choose TSV, CSV or Markdown, then Copy table.
+
+Empty cells remain empty. TSV/CSV quote separators, quotes and multiline values; Markdown escapes literal markup and represents line breaks as `<br>`. Formula-leading spreadsheet text gets a literal apostrophe prefix; ordinary negative numbers stay numeric. No image or project content is changed.
+
+Inference is conservative and can need boundary correction, especially for wrapped cells. Only selected, currently visible glyphs participate. The preview rechecks masks and crop boundaries before copying and closes if its visible words change.
+
 ## Redaction and editable projects
 
 Privacy zones replace covered pixels in the canvas, clipboard and exported PNG. Select **Black redaction** or **Pixelated privacy**. Pixelated privacy uses an opaque, source-independent grey-blue mosaic; it never averages or samples sensitive pixels. Conventional blur or pixelation can preserve recoverable information. Context outside the zone can still reveal information, so cover the entire sensitive area.
@@ -309,7 +344,7 @@ The preview shows the stitched image and newest seam. Repeated or changing conte
 ## Privacy and performance
 
 - Built-in capture, inference, fitting and rendering run locally without vendor telemetry. User-selected copy programs and stylesheets have their own behavior.
-- Direct shared-memory capture avoids a capture subprocess and an intermediate PNG encode/decode cycle. The read-only capture mapping is converted to pixels once; only interactive coordinate selection launches `slurp`.
+- Direct shared-memory still capture avoids a capture subprocess and an intermediate PNG encode/decode cycle. Precision selection crops the frozen pixels in-process; guided scrolling and portal backends may use their own picker/helper. Recordings stream through PipeWire/GStreamer to a bounded private clip instead of retaining every raw frame.
 - The screenshot's Cairo surface, committed canvas commands and a viewport-sized raster are cached separately from interaction overlays. The raster uses the current display density, not a full-document bitmap enlarged with zoom. Transform and caption previews use the full painter to preserve transparency and mask ordering. Interaction rendering has no continuous frame timer.
 - Pango logical text bounds use a thread-local cache capped at 4,096 entries and 4 MiB of text. Mark lookups validate cached ID-to-position indexes against the live scene; selection geometry reuses these lookups and text measurements.
 - OCR visibility is reused only while the recognised page, crop, image dimensions and individual privacy-mask hulls match. Mask geometry is checked before reuse; invalid geometry blocks text rather than exposing it. Gaps between separate masks remain selectable.
@@ -342,8 +377,8 @@ An explicit `--stylesheet FILE` is a higher-priority opt-in override. Invalid, n
 
 ## Limits
 
-- Without `--region` or `--geometry`, capture selects one output. Choose a monitor explicitly if the compositor's first output is not the one you want.
-- Requires the wlroots screencopy protocol. GNOME and KDE capture portals are not implemented.
+- Direct capture defaults to one output; the precision selector shows the captured desktop. Portal source selection belongs to the desktop.
+- Guided scrolling needs wlroots screencopy. Portal capture/recording needs a working matching backend; GNOME/KDE dialogs and backend-owned files follow desktop policy.
 - Smart recognition is single-stroke and confidence-gated. It does not turn arbitrary handwriting or multi-stroke drawings into shapes. Freehand is always available.
 - Source-derived blur/pixelation, multi-image composition and multi-page documents are not implemented.
 - Projects and recovery copies retain the original screenshot, including pixels hidden by privacy masks. Share rendered exports instead.
@@ -358,6 +393,16 @@ cargo test --locked
 ```
 
 Regression coverage includes pixel formats, stride, rotation, HiDPI geometry, annotation/crop history, recognition completing during undo, PNG rendering and overwrite protection, shape preprocessing/fitting, and the vendor's stroke fixtures. Compositor and editor smoke testing must run in a real or headless Wayland session; unit tests alone do not exercise screencopy or GTK input.
+
+Capture additions passed 340 release-mode regressions, including a real full-chroma MJPEG preview decode, odd-dimension WebM geometry/timing, owner-only recording files, and in-place selector limits. Real GNOME Shell/Mutter 48 with portal-gnome 48 and KWin 6.3.6 with portal-kde exercised screenshot consent/cancel, PNG-only stdout, unsupported-option errors and the precision loupe. Keyboard-adjusted crops matched independent native reference frames pixel-for-pixel.
+
+Release-to-capture and the object eraser passed 349 release-mode regressions. Native GTK checks captured a pixel-exact crop on mouse release without Enter, cancelled a held selection with Escape, and retained keyboard-only selection. Eraser checks covered OCR-to-eraser activation, immediate deletion on press, held-drag deletion, one-step Undo/Redo, no deletion on hover, pixel-identical background preservation, and auto-copy waiting until the stroke ended.
+
+Native PaddleOCR checks copied an exact five-row, three-column table as TSV, CSV and Markdown, including an empty cell, a wrapped cell, a formula-like literal and a negative number. The headless pixman/wlr-portal setup could not provide a ScreenCast pixel format; recording verification used the real Mutter and KWin PipeWire backends instead.
+
+A strict 37-assertion table UI run covered row/column split/join/reset, mask-filtered clipboard content, Undo closing a stale preview, descriptive accessible headers, and actual word/blank context-menu actions with first-Escape dismissal.
+
+Final GNOME/KDE recording checks exercised hidden and visible controls, on-screen Stop/Close, in-place minimum/budget rejection, clean full-chroma playback, stable Play/Pause geometry and odd-sized GIF/WebM output. A 5-second clip contained 75 frames at 15 fps; frames 15–59 exported as 45 frames and 3.000 seconds. GNOME's desktop sharing Stop preserved a reviewable clip instead of discarding it. Under umask 0000, recording directories were 0700 and clips/logs/exports were 0600. Normal Close removed the temporary clip.
 
 Version 0.2 passed 302 release-mode regressions, including configured font-face B/I removal and restoration, moved-draft atomic undo, highlighter alpha, filled/rounded hit geometry, marker rings, format-5 persistence and nonblocking FIFO rejection. Native X11 checks exercised stdin limits, CLI/config precedence, literal typing under custom shortcuts, Enter/outside-click caption application, named saves, overwrite refusal, auto-copy, external helper failures/deadlines and clipboard persistence after exit.
 

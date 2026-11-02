@@ -13,9 +13,9 @@ The 50-second recording uses the real GTK editor. The demo and screenshots use s
 ## Features
 
 - Sketch a smart shape, choose a correction or keep the original stroke. Manual arrows, lines, rectangles, ellipses and hold-to-size numbered markers remain editable.
-- Select, group, move, resize and rotate objects. Change their stacking order, fill, rounded corners, line caps, decimal stroke widths and arrow-tip sizes, with undo for whole edits.
+- Select, group, move, resize and rotate objects. Change their stacking order, fill, rounded corners, line caps, decimal stroke widths and arrow-tip sizes. Click or hold-drag with the object eraser; one Undo restores an erase gesture.
 - Type on the image with native text editing, font families and faces, bold/italic, alignment, wrapping and outline/shadow effects. Resizing keeps glyph proportions.
-- Select recognised words or multiline text with on-device PaddleOCR. Copy formatted text or use context menus for highlighting, underlining, strike-through and direct redaction.
+- Select recognised words or multiline text with on-device PaddleOCR. Preview tables, adjust row/column splits and copy TSV, CSV or Markdown. Context menus add highlighting, underlining, strike-through and direct redaction.
 - Draw block and freehand highlighters. Protect sensitive areas with opaque redaction or a source-independent pixelated privacy zone; spotlight and magnifier tools call attention to details.
 - Crop and resize, then use Designer looks, gradients, spacing, rounded or square corners, borders and shadows. Save frames for product screenshots and social posts.
 - Zoom around the cursor, pan with the middle mouse button or touchpad, and search the command palette. Right-click menus follow the selected object or current mode.
@@ -25,23 +25,26 @@ The 50-second recording uses the real GTK editor. The demo and screenshots use s
 
 ## Requirements
 
-- Linux x86-64 with GTK 4.8+, Cairo 1.16+ and the usual desktop runtime. Existing images can be edited under Wayland or X11.
-- Desktop capture needs a compositor exposing the wlroots screencopy protocol, such as Hyprland. GNOME/KDE capture portals are not implemented.
-- `slurp` is required for interactive region selection, not for editing an existing image or giving capture coordinates.
+- Linux x86-64 with GTK 4.8+, Cairo 1.16+ and GStreamer core/app/video libraries. Existing images can be edited under Wayland or X11.
+- Desktop capture uses direct wlroots screencopy when available, otherwise the desktop screenshot portal on GNOME/KDE. Install the portal backend matching your desktop.
+- Precision region capture has a built-in pixel loupe and keyboard adjustment. Guided scrolling still needs `slurp` unless you supply `--geometry`; portal backends may also use their own picker.
+- Recording needs PipeWire, a ScreenCast portal backend, GStreamer PipeWire/base/good/bad/libav plugins and `ffmpeg` with VP9 support.
 - Building needs Rust 1.92+, Cargo, pkg-config and a C/C++ toolchain.
 
-The downloadable build needs glibc 2.39+ and libstdc++ providing `GLIBCXX_3.4.31` or later. Debian 13 works; Debian 12's native libraries are too old for the bundled inference runtime. Fonts come from your system. Install the families you want to use, including an emoji font if needed.
+The downloadable build needs glibc 2.39+ and libstdc++ providing `GLIBCXX_3.4.31` or later. Debian 13 works; Debian 12's native libraries are too old for this build. Fonts come from your system. Install the families you want to use, including an emoji font if needed.
 
 ## Install
 
 ### Download a build
 
+Version 0.3.0 includes desktop portal capture, release-to-capture selection, OCR table copying, GIF/WebM recording and the object eraser. The supported release target is `x86_64-unknown-linux-gnu`; Wayland and X11 use the same archive.
+
 Download the Linux x86-64 archive and `SHA256SUMS` from the [latest release](https://github.com/Osyna/Screnerrr/releases/latest), into the same directory:
 
 ```sh
 sha256sum -c SHA256SUMS
-tar -xzf sharpshot-v0.2.0-linux-x86_64.tar.gz
-cd sharpshot-v0.2.0-linux-x86_64
+tar -xzf sharpshot-v0.3.0-linux-x86_64.tar.gz
+cd sharpshot-v0.3.0-linux-x86_64
 ./sharpshot --version
 ./sharpshot --help
 ```
@@ -51,13 +54,13 @@ Keep `libLiteRt.so` and `libgtk4-layer-shell.so.0` beside the executable. Add th
 Runtime packages on Arch Linux:
 
 ```sh
-sudo pacman -S --needed gtk4 gcc-libs slurp ttf-dejavu
+sudo pacman -S --needed gtk4 gcc-libs slurp ttf-dejavu gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav gst-plugin-pipewire ffmpeg pipewire wireplumber xdg-desktop-portal
 ```
 
 On Debian 13:
 
 ```sh
-sudo apt install libgtk-4-1 libstdc++6 slurp fonts-dejavu-core
+sudo apt install libgtk-4-1 libstdc++6 slurp fonts-dejavu-core libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav ffmpeg pipewire wireplumber xdg-desktop-portal
 ```
 
 ### Build from source
@@ -65,14 +68,16 @@ sudo apt install libgtk-4-1 libstdc++6 slurp fonts-dejavu-core
 On Arch Linux:
 
 ```sh
-sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp ttf-dejavu
+sudo pacman -S --needed rust base-devel pkgconf gtk4 openssl slurp ttf-dejavu gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav gst-plugin-pipewire ffmpeg pipewire wireplumber xdg-desktop-portal
 ```
 
 On Debian 13, install Rust using [rustup](https://rustup.rs), then:
 
 ```sh
-sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp fonts-dejavu-core
+sudo apt install build-essential pkg-config libgtk-4-dev libssl-dev ca-certificates slurp fonts-dejavu-core libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav ffmpeg pipewire wireplumber xdg-desktop-portal
 ```
+
+Install your desktop's portal backend too: `xdg-desktop-portal-gnome`, `xdg-desktop-portal-kde`, or the appropriate wlroots/Hyprland backend.
 
 Build and check the executable:
 
@@ -137,6 +142,8 @@ bind = SUPER ALT, S, exec, sharpshot --region
 4. Press `F8` for the text layer. Select a word, line or multiline region, then right-click for copy and markup actions. Review recognised text before relying on it. Mask sensitive content before sharing.
 5. Open Crop and resize or Designer, choose a look and adjust its frame or canvas size. Copy the result or save a PNG. Use a `.sharp` project only when you need to keep the scene editable.
 
+`X` selects Eraser: click an annotation to remove it immediately, or hold the left button and drag across objects. It never changes the screenshot background. Ctrl+Z restores the whole stroke; Esc stops erasing and keeps removals. Privacy masks can also be erased, revealing the underlying screenshot.
+
 ### Shortcuts
 
 `?` opens the full guide. These are defaults; custom bindings replace them, while focused text and numeric fields keep their editing keys.
@@ -144,6 +151,7 @@ bind = SUPER ALT, S, exec, sharpshot --region
 | Keys | Action |
 | --- | --- |
 | `V` `S` `P` `A` `L` `R` `E` `T` | Select, smart shape, freehand, arrow, line, rectangle, ellipse, text |
+| `X` | Eraser: click or hold-drag to remove annotations; one Undo restores the stroke |
 | `C` `B` `N` `M` `H` | Crop, privacy zone, numbered step, magnifier, spotlight |
 | `G` / `Shift+G` | Primary / alternate highlighter |
 | `F` / `K` | Toggle fill / round line ends |
@@ -170,6 +178,32 @@ bind = SUPER ALT, S, exec, sharpshot --region
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 
 Commands use an extracted or installed executable. From a build tree, substitute `./target/release/sharpshot`.
+
+### Select exact capture pixels
+
+Run `sharpshot --region`. Drag on the frozen screenshot and release the mouse button to capture; no Enter is needed. The loupe shows source pixels at 8×. For keyboard-only selection, arrows move the region by one source pixel, Shift multiplies by ten, Ctrl+arrows adjust its right/bottom edges and Alt+arrows adjust its left/top edges; Enter captures. Escape cancels without writing the requested output.
+
+On portal desktops, choose the source in the system dialog for normal captures. Explicit `--output`, global `--geometry` and `--cursor` remain direct-wlroots options. GNOME may remember denied screenshot permission; review desktop permissions if later requests show no dialog. Some portal backends cannot distinguish cancellation, denial and failure.
+
+**Portal privacy:** the desktop can keep its own original screenshot in Pictures/Screenshots, including the uncropped image used by the precision selector. SharpShot does not delete portal-owned files.
+
+### Copy a table from a screenshot
+
+Enable OCR with F8, select the table text (or leave nothing selected to use all visible text), then choose **Copy as table** in the OCR toolbar or right-click menu. Review the inferred grid, join/split rows or columns if necessary, choose TSV, CSV or Markdown, then Copy table.
+
+Missing cells stay empty; multiline TSV/CSV cells are quoted and Markdown line breaks become `<br>`. Spreadsheet formula-leading text is copied as a literal string. Masks and crop boundaries are respected; changing the visible table closes a stale preview before it can copy hidden text. OCR and table inference can make mistakes, so inspect the preview.
+
+### Record a short region
+
+```sh
+sharpshot --record
+```
+
+Choose a screen/window through the system portal, select a region of at least 16 × 16 pixels (at most 8 megapixels), then start a 5–30 second recording. Controls hide by default; the timer ends recording, or use the desktop sharing indicator if it offers early stop. Uncheck Hide controls to keep a Stop button, and place it outside the recorded region.
+
+Cursor visibility follows the portal request; the tested KWin virtual backend still embedded its cursor with Hidden requested. Check the preview before sharing.
+
+Play the preview, adjust Start and End by frame, and save GIF or WebM. Both use 15 fps and the same kept frames; existing files are never replaced. There is no audio, timeline or composition UI. A private temporary clip is deleted when the preview closes; an abrupt process kill can leave it in the OS temporary directory.
 
 ## Configuration
 

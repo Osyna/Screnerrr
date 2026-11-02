@@ -8,12 +8,16 @@ mod editor;
 mod inspector;
 mod interaction;
 mod ocr;
+mod ocr_table;
 mod ocr_ui;
 mod palette;
 mod pin;
+mod portal;
+mod precision;
 mod presentation;
 mod presets;
 mod project;
+mod recording;
 mod recovery;
 mod scrolling;
 mod settings;
@@ -37,7 +41,7 @@ const MAX_INPUT_PIXELS: u64 = 1 << 27;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Capture and annotate Wayland screenshots with offline smart shapes"
+    about = "Capture and annotate Linux screenshots with offline smart shapes and OCR"
 )]
 struct Args {
     /// Edit an existing image instead of capturing the screen; `-` reads PNG/JPEG/WebP from stdin
@@ -52,7 +56,7 @@ struct Args {
     /// Include the pointer in the capture
     #[arg(long)]
     cursor: bool,
-    /// Drag a screen zone to capture (uses slurp for selection only; Escape cancels)
+    /// Select exact screenshot pixels with a loupe and keyboard edge adjustment
     #[arg(short, long, conflicts_with_all = ["input", "output", "geometry", "list_outputs"])]
     region: bool,
     /// Capture a global logical rectangle, e.g. -100,20 640x480
@@ -68,6 +72,9 @@ struct Args {
     /// Guided scrolling capture of a region; scroll the source yourself between frames
     #[arg(long, conflicts_with_all = ["input", "project", "capture", "list_outputs", "output", "toggle_pins"])]
     scroll: bool,
+    /// Record a short screen region, preview, trim and export GIF or WebM
+    #[arg(long, conflicts_with_all = ["input", "project", "capture", "list_outputs", "output", "geometry", "region", "cursor", "scroll", "toggle_pins", "pin_helper"])]
+    record: bool,
     /// Hide/show pinned references (suitable for a compositor keyboard binding)
     #[arg(long, conflicts_with_all = ["input", "project", "capture", "list_outputs", "output", "geometry", "region", "cursor"])]
     toggle_pins: bool,
@@ -87,6 +94,9 @@ fn main() -> Result<()> {
     if args.toggle_pins {
         return pin::toggle_all();
     }
+    if args.record {
+        return recording::run();
+    }
     if args.list_outputs {
         for name in capture::outputs()? {
             println!("{name}");
@@ -105,7 +115,7 @@ fn main() -> Result<()> {
         lap(profile, started, "project loaded");
         return editor::run(doc, settings.clone());
     }
-    let geometry = if args.region || (args.scroll && args.geometry.is_none()) {
+    let geometry = if args.scroll && args.geometry.is_none() {
         match select_region()? {
             Some(region) => Some(region),
             None => return Ok(()),
@@ -135,10 +145,14 @@ fn main() -> Result<()> {
             decode_image(std::io::BufReader::new(file))
                 .with_context(|| format!("Cannot decode {}", path.display()))?
         }
-        None => match geometry {
-            Some(region) => capture::capture_region(region, args.cursor)?,
-            None => capture::capture(args.output.as_deref(), args.cursor)?,
-        },
+        None => {
+            let Some(image) =
+                acquire_screenshot(args.output.as_deref(), geometry, args.cursor, args.region)?
+            else {
+                return Ok(());
+            };
+            image
+        }
     };
     lap(profile, started, "image acquired");
     if let Some(path) = args.capture {
@@ -261,12 +275,52 @@ fn decode_image(mut input: impl BufRead + Seek) -> Result<RgbaImage> {
     Ok(reader.decode()?.into_rgba8())
 }
 
+fn acquire_screenshot(
+    output: Option<&str>,
+    geometry: Option<capture::Region>,
+    cursor: bool,
+    precision: bool,
+) -> Result<Option<RgbaImage>> {
+    let image = if let Some(image) = capture::try_capture(output, geometry, precision, cursor)? {
+        image
+    } else {
+        ensure!(
+            output.is_none(),
+            "This desktop uses the screenshot portal; choose the monitor in its capture dialog instead of --output."
+        );
+        ensure!(
+            geometry.is_none(),
+            "Global --geometry needs wlroots screencopy; use --region for pixel-precise portal capture on this desktop."
+        );
+        ensure!(
+            !cursor,
+            "The screenshot portal controls cursor inclusion; --cursor is only available with direct wlroots capture."
+        );
+        let Some(image) =
+            gtk::glib::MainContext::default().block_on(portal::screenshot(!precision))?
+        else {
+            return Ok(None);
+        };
+        image
+    };
+    if precision {
+        let Some(crop) = precision::select(&image, 1, MAX_INPUT_PIXELS)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            image::imageops::crop_imm(&image, crop.x, crop.y, crop.width, crop.height).to_image(),
+        ))
+    } else {
+        Ok(Some(image))
+    }
+}
+
 fn select_region() -> Result<Option<capture::Region>> {
     let output = Command::new("slurp")
         .args(["-d", "-f", "%x,%y %wx%h"])
         .stdin(Stdio::null())
         .output()
-        .context("Cannot start slurp; install it for --region or use --geometry instead")?;
+        .context("Cannot start slurp; install it for --scroll or supply --geometry instead")?;
     selected_region(output)
 }
 
@@ -408,5 +462,24 @@ mod tests {
         assert!(read_image(&bytes[..bytes.len() / 2], MAX_INPUT_BYTES).is_err());
         assert!(read_image(&png(MAX_INPUT_SIDE + 1, 1)[..], MAX_INPUT_BYTES).is_err());
         assert!(read_image(std::io::repeat(0), 1 << 16).is_err());
+    }
+
+    #[test]
+    fn recording_rejects_still_capture_and_project_options() {
+        for conflicting in [
+            vec!["--input", "image.png"],
+            vec!["--project", "private.sharp"],
+            vec!["--capture", "capture.png"],
+            vec!["--region"],
+            vec!["--geometry", "0,0 100x100"],
+            vec!["--scroll"],
+        ] {
+            let mut args = vec!["sharpshot", "--record"];
+            args.extend(conflicting);
+            assert_eq!(
+                Args::try_parse_from(args).err().unwrap().kind(),
+                clap::error::ErrorKind::ArgumentConflict
+            );
+        }
     }
 }

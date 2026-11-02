@@ -13,6 +13,7 @@ use std::{
 pub(super) fn tool_name(tool: Tool) -> &'static str {
     match tool {
         Tool::Select => "select",
+        Tool::Eraser => "eraser",
         Tool::Smart => "smart",
         Tool::Ink => "freehand",
         Tool::Arrow => "arrow",
@@ -76,7 +77,9 @@ impl View {
         }
         if let Some((_, button)) = self.tools.iter().find(|(tool, _)| tool_name(*tool) == name) {
             if button.is_sensitive() {
+                self.ocr.cancel();
                 button.set_active(true);
+                self.area.grab_focus();
                 return true;
             }
             return false;
@@ -310,6 +313,7 @@ impl View {
         }
         let tool = match key.to_lower() {
             gdk::Key::v => Some(Tool::Select),
+            gdk::Key::x => Some(Tool::Eraser),
             gdk::Key::s => Some(Tool::Smart),
             gdk::Key::p => Some(Tool::Ink),
             gdk::Key::a => Some(Tool::Arrow),
@@ -599,7 +603,11 @@ impl View {
     }
     pub(super) fn schedule_auto(self: &Rc<Self>, state: &State) {
         let revision = state.doc.revision();
-        if !self.settings.auto_copy || revision == self.auto_revision.get() {
+        if !self.settings.auto_copy
+            || state.gesture.is_some()
+            || state.text_draft.is_some()
+            || revision == self.auto_revision.get()
+        {
             return;
         }
         self.auto_revision.set(revision);

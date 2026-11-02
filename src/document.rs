@@ -1952,6 +1952,8 @@ pub struct Document {
     pub presentation: Presentation,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
+    /// Eraser inverses in reverse application order; sealed before any other undoable edit.
+    erase: Option<Edit>,
     next_id: u64,
     /// Counts every visible change of marks, crop or presentation, undo and redo included.
     revision: u64,
@@ -2129,6 +2131,7 @@ impl Document {
             crop: None,
             undo: vec![],
             redo: vec![],
+            erase: None,
             next_id: 0,
             revision: 0,
             presentation: Presentation::default(),
@@ -2183,7 +2186,7 @@ impl Document {
         self.next_id
     }
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.undo.is_empty() || self.erase.as_ref().is_some_and(|edit| !edit.is_empty())
     }
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
@@ -2229,6 +2232,7 @@ impl Document {
     }
 
     fn commit(&mut self, edit: Edit) {
+        self.finish_erase();
         self.undo.push(edit);
         self.redo.clear();
         self.revision += 1;
@@ -2273,7 +2277,12 @@ impl Document {
             }
         };
         self.marks.iter_mut().for_each(&mut hit);
-        for edit in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+        for edit in self
+            .undo
+            .iter_mut()
+            .chain(self.redo.iter_mut())
+            .chain(self.erase.iter_mut())
+        {
             for op in edit.iter_mut() {
                 match op {
                     Op::Set(marks) => marks.iter_mut().for_each(&mut hit),
@@ -3183,9 +3192,17 @@ impl Document {
     /// Deletes the selection as one undo. Connectors attached to a deleted mark stay where they were
     /// drawn (detached); steps renumber. Undo restores all of it.
     pub fn remove_many(&mut self, ids: &[u64]) -> bool {
+        let Some(inverse) = self.remove_inverse(ids) else {
+            return false;
+        };
+        self.commit(inverse);
+        true
+    }
+
+    fn remove_inverse(&mut self, ids: &[u64]) -> Option<Edit> {
         let removed = self.expand_groups(ids);
         if removed.is_empty() {
-            return false;
+            return None;
         }
         let mut changed: HashMap<u64, Mark> = HashMap::new();
         let left = || self.marks.iter().filter(|m| !removed.contains(&m.id));
@@ -3230,8 +3247,39 @@ impl Document {
         }
         inverse.push(self.apply_op(Op::Remove(removed)));
         inverse.reverse();
-        self.commit(inverse);
+        Some(inverse)
+    }
+
+    pub(crate) fn begin_erase(&mut self) {
+        self.finish_erase();
+        self.erase = Some(vec![]);
+    }
+
+    /// A foreign undoable edit ends the stroke; subsequent motion cannot absorb its history.
+    pub(crate) fn erase_at(&mut self, p: Point, tolerance: f32) -> bool {
+        if self.erase.is_none() {
+            return false;
+        }
+        let Some(id) = self.hit_test(p, tolerance) else {
+            return false;
+        };
+        let Some(mut inverse) = self.remove_inverse(&[id]) else {
+            return false;
+        };
+        inverse.reverse();
+        self.erase.as_mut().unwrap().append(&mut inverse);
+        self.redo.clear();
+        self.revision += 1;
         true
+    }
+
+    pub(crate) fn finish_erase(&mut self) {
+        if let Some(mut edit) = self.erase.take()
+            && !edit.is_empty()
+        {
+            edit.reverse();
+            self.undo.push(edit);
+        }
     }
 
     /// Copies the (expanded) selection on top, shifted by `DUPLICATE_OFFSET`; groups and links
@@ -3415,6 +3463,7 @@ impl Document {
     }
 
     pub fn undo(&mut self) {
+        self.finish_erase();
         if let Some(edit) = self.undo.pop() {
             let inverse = self.apply(edit);
             self.redo.push(inverse);
@@ -3422,6 +3471,7 @@ impl Document {
         }
     }
     pub fn redo(&mut self) {
+        self.finish_erase();
         if let Some(edit) = self.redo.pop() {
             let inverse = self.apply(edit);
             self.undo.push(inverse);
@@ -3725,6 +3775,47 @@ mod tests {
                 text: None,
             },
         )?)
+    }
+
+    #[test]
+    fn erasing_privacy_masks_never_changes_source_and_one_undo_restores_flattened_pixels()
+    -> Result<()> {
+        let source = RgbaImage::from_fn(100, 80, |x, y| image::Rgba([x as u8, y as u8, 173, 255]));
+        let mut doc = Document::new(source.clone())?;
+        doc.add(Mark::redaction(1, point(10., 10.), point(40., 40.)));
+        doc.add(Mark::privacy_blur(2, point(60., 10.), point(90., 40.)));
+        let masked = doc.render()?;
+        let private = doc.privacy_snapshot();
+        let region = Bounds {
+            x: 15.,
+            y: 15.,
+            width: 5.,
+            height: 5.,
+        };
+        assert!(private.is_private(region));
+        doc.begin_erase();
+        assert!(doc.erase_at(point(20., 20.), 0.));
+        assert!(!doc.privacy_snapshot().is_private(region));
+        assert!(
+            private.is_private(region),
+            "older privacy snapshots remain conservative"
+        );
+        assert!(doc.erase_at(point(70., 20.), 0.));
+        assert_eq!(
+            doc.render()?,
+            source,
+            "intentional mask erasure reveals only stored source"
+        );
+        assert_eq!(doc.background_image()?, source);
+        doc.finish_erase();
+        doc.undo();
+        assert_eq!(doc.render()?, masked);
+        assert!(doc.privacy_snapshot().is_private(region));
+        assert_eq!(doc.background_image()?, source);
+        doc.redo();
+        assert_eq!(doc.render()?, source);
+        assert_eq!(doc.background_image()?, source);
+        Ok(())
     }
 
     #[test]

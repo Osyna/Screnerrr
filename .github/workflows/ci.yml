@@ -20,7 +20,7 @@ jobs:
       - name: Install native dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git g++ pkg-config libgtk-4-dev libssl-dev ca-certificates fonts-dejavu-core
+          apt-get install -y --no-install-recommends git g++ pkg-config libgtk-4-dev libssl-dev ca-certificates fonts-dejavu-core libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav ffmpeg
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install formatter
         run: rustup component add rustfmt

@@ -24,6 +24,7 @@ const MAX_STYLESHEET_BYTES: u64 = 256 << 10;
 /// Tool names accepted by `initial_tool`.
 pub const TOOLS: &[&str] = &[
     "select",
+    "eraser",
     "smart",
     "freehand",
     "arrow",
@@ -43,6 +44,7 @@ pub const TOOLS: &[&str] = &[
 /// Commands that `keybinds` may rebind; values use GTK accelerator syntax (`<Ctrl><Shift>s`).
 pub const COMMANDS: &[&str] = &[
     "select",
+    "eraser",
     "smart",
     "freehand",
     "arrow",

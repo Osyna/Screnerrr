@@ -128,20 +128,91 @@ impl FromStr for Region {
     }
 }
 
-/// Capture one output (the first one when `output` is `None`) as RGBA, upright
-/// and at native pixel size. Alpha is always opaque.
-pub fn capture(output: Option<&str>, cursor: bool) -> Result<RgbaImage> {
-    let mut s = Session::connect()?;
-    let idx = s.pick_output(output)?;
-    let (manager, shm) = s.bind_screencopy()?;
-    grab_output(&mut s, &manager, &shm, idx, cursor)
-}
-
 /// Capture a global logical rectangle at the highest participating output scale.
 /// Gaps remain transparent. Transformed outputs use an upright full-frame crop.
 pub fn capture_region(region: Region, cursor: bool) -> Result<RgbaImage> {
-    let mut s = Session::connect()?;
+    capture_region_in(&mut Session::connect()?, region, cursor)
+}
+
+/// One screencopy capture on a single compositor session: the whole `desktop`,
+/// a global logical `region`, or one `output` (the first by default); at most
+/// one selector may be given. `Ok(None)` only means the compositor cannot be
+/// reached or has no `zwlr_screencopy_manager_v1` (use the portal instead);
+/// capture, permission and geometry failures are errors.
+pub fn try_capture(
+    output: Option<&str>,
+    region: Option<Region>,
+    desktop: bool,
+    cursor: bool,
+) -> Result<Option<RgbaImage>> {
+    ensure!(
+        u8::from(output.is_some()) + u8::from(region.is_some()) + u8::from(desktop) <= 1,
+        "choose one of an output, a region or the whole desktop"
+    );
+    let mut s = match Session::connect() {
+        Ok(s) => s,
+        Err(e) if e.is::<Unavailable>() => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let iface = ZwlrScreencopyManagerV1::interface().name;
+    if !s.state.globals.iter().any(|g| g.interface == iface) {
+        return Ok(None);
+    }
+    let image = match region {
+        Some(region) => capture_region_in(&mut s, region, cursor)?,
+        None if desktop => desktop_in(&mut s, cursor)?,
+        None => capture_output_in(&mut s, output, cursor)?,
+    };
+    Ok(Some(image))
+}
+
+/// The Wayland socket could not be opened; the one failure `try_capture` treats as "no screencopy here".
+#[derive(Debug)]
+struct Unavailable(String);
+
+impl fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+fn capture_output_in(s: &mut Session, output: Option<&str>, cursor: bool) -> Result<RgbaImage> {
+    let idx = s.pick_output(output)?;
+    let (manager, shm) = s.bind_screencopy()?;
+    grab_output(s, &manager, &shm, idx, cursor)
+}
+
+fn capture_region_in(s: &mut Session, region: Region, cursor: bool) -> Result<RgbaImage> {
     s.load_logical()?;
+    capture_logical(s, region, cursor)
+}
+
+fn desktop_in(s: &mut Session, cursor: bool) -> Result<RgbaImage> {
+    s.load_logical()?;
+    let mut rects = s.state.outputs.iter().filter_map(OutputInfo::logical);
+    let first = rects
+        .next()
+        .context("no enabled output has a logical size")?;
+    let (mut x0, mut y0) = (i64::from(first.x), i64::from(first.y));
+    let (mut x1, mut y1) = (x0 + i64::from(first.width), y0 + i64::from(first.height));
+    for r in rects {
+        x0 = x0.min(i64::from(r.x));
+        y0 = y0.min(i64::from(r.y));
+        x1 = x1.max(i64::from(r.x) + i64::from(r.width));
+        y1 = y1.max(i64::from(r.y) + i64::from(r.height));
+    }
+    let region = Region {
+        x: i32::try_from(x0)?,
+        y: i32::try_from(y0)?,
+        width: u32::try_from(x1 - x0)?,
+        height: u32::try_from(y1 - y0)?,
+    };
+    capture_logical(s, region, cursor)
+}
+
+fn capture_logical(s: &mut Session, region: Region, cursor: bool) -> Result<RgbaImage> {
     let (manager, shm) = s.bind_screencopy()?;
 
     let rects: Vec<(usize, Region)> = s
@@ -171,7 +242,7 @@ pub fn capture_region(region: Region, cursor: bool) -> Result<RgbaImage> {
         };
         let l = p.local;
         let img = if transform == 0 {
-            grab(&mut s, &shm, |qh| {
+            grab(s, &shm, |qh| {
                 manager.capture_output_region(
                     cursor as i32,
                     &wl,
@@ -185,7 +256,7 @@ pub fn capture_region(region: Region, cursor: bool) -> Result<RgbaImage> {
             })
         } else {
             // shortcut: transformed outputs use a full frame until compositor ROI coordinates agree.
-            grab_output(&mut s, &manager, &shm, p.output, cursor)
+            grab_output(s, &manager, &shm, p.output, cursor)
                 .and_then(|image| crop_upright(image, l, (logical.width, logical.height)))
         }
         .with_context(|| format!("capturing {l} of output {label}"))?;
@@ -421,9 +492,11 @@ struct Session {
 impl Session {
     /// Connect and learn about all globals and outputs.
     fn connect() -> Result<Self> {
-        let conn = Connection::connect_to_env().context(
-            "connecting to the Wayland compositor (is WAYLAND_DISPLAY set and a Wayland session running?)",
-        )?;
+        let conn = Connection::connect_to_env().map_err(|e| {
+            anyhow::Error::new(Unavailable(format!(
+                "connecting to the Wayland compositor (is WAYLAND_DISPLAY set and a Wayland session running?): {e}"
+            )))
+        })?;
         let queue = conn.new_event_queue();
         let qh = queue.handle();
         let registry = conn.display().get_registry(&qh, ());

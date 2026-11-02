@@ -34,6 +34,12 @@ const TOOLS: &[(Tool, Icon, &str, &str)] = &[
         "V · Select, move, resize and rotate. Shift-click adds; drag empty space to select several.",
     ),
     (
+        Tool::Eraser,
+        Icon::Eraser,
+        "Eraser",
+        "X · Click an annotation or hold the left button and drag to erase whole objects. Privacy masks can also be removed; Undo restores the gesture. Esc stops erasing and keeps removals.",
+    ),
+    (
         Tool::Smart,
         Icon::Smart,
         "Smart shape",
@@ -211,6 +217,7 @@ impl View {
     fn refresh(self: &Rc<Self>, state: &State) {
         self.menu.popdown();
         let editing = state.text_draft.is_some();
+        let eraser = state.tool == Tool::Eraser;
         self.undo.set_sensitive(state.doc.can_undo() && !editing);
         self.redo.set_sensitive(state.doc.can_redo() && !editing);
         let count = state
@@ -322,12 +329,14 @@ impl View {
         ));
         self.width.set_value(width);
         self.opacity.set_value(color[3] * 100.);
-        self.width.set_sensitive(!text && state.tool != Tool::Text);
+        self.width
+            .set_sensitive(!eraser && !text && state.tool != Tool::Text);
         self.fill.set_active(state.fill());
         self.round_caps.set_active(state.round_caps());
         self.corner_radius.set_value(state.corner_radius());
         self.fill.set_sensitive(
-            !editing
+            !eraser
+                && !editing
                 && (matches!(state.tool, Tool::Smart | Tool::Rectangle | Tool::Ellipse)
                     || state
                         .selected
@@ -335,7 +344,8 @@ impl View {
                         .any(|id| state.doc.mark(*id).is_some_and(|m| m.fillable()))),
         );
         self.round_caps.set_sensitive(
-            !editing
+            !eraser
+                && !editing
                 && (matches!(
                     state.tool,
                     Tool::Smart | Tool::Ink | Tool::Arrow | Tool::Line | Tool::Highlighter
@@ -345,7 +355,8 @@ impl View {
                     .any(|id| state.doc.mark(*id).is_some_and(|m| m.stroked()))),
         );
         self.corner_radius.set_sensitive(
-            !editing
+            !eraser
+                && !editing
                 && (state.tool == Tool::Rectangle
                     || state
                         .selected
@@ -356,16 +367,17 @@ impl View {
             .selected
             .iter()
             .any(|id| state.doc.mark(*id).is_some_and(|m| m.is_redaction()));
-        self.color.set_sensitive(!redaction && !editing);
-        self.opacity.set_sensitive(!redaction && !editing);
+        self.color.set_sensitive(!eraser && !redaction && !editing);
+        self.opacity
+            .set_sensitive(!eraser && !redaction && !editing);
         for (button, rgb, alpha) in &self.swatches {
-            button.set_sensitive(!redaction && !editing);
+            button.set_sensitive(!eraser && !redaction && !editing);
             button.set_active(
                 (0..if *alpha { 4 } else { 3 }).all(|i| (color[i] - rgb[i]).abs() < 0.005),
             );
         }
         for (button, value) in &self.presets {
-            button.set_sensitive(!editing && !text);
+            button.set_sensitive(!eraser && !editing && !text);
             button.set_active((width - value).abs() < 0.01);
         }
         self.syncing.set(false);
@@ -966,14 +978,27 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         tool_buttons.push((tool, button));
     }
     let tool_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .hscrollbar_policy(gtk::PolicyType::External)
         .vscrollbar_policy(gtk::PolicyType::Never)
         .min_content_width(140)
-        .max_content_width(640)
         .min_content_height(44)
         .propagate_natural_width(true)
         .child(&tools)
         .build();
+    let tool_wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    let tool_adjustment = tool_scroll.hadjustment();
+    // External policy hides the bar; map either wheel axis onto the tool strip.
+    tool_wheel.connect_scroll(move |controller, dx, dy| {
+        let delta = if dx.abs() > dy.abs() { dx } else { dy };
+        let step = if controller.unit() == gdk::ScrollUnit::Surface {
+            1.
+        } else {
+            tool_adjustment.step_increment()
+        };
+        tool_adjustment.set_value(tool_adjustment.value() + delta * step);
+        glib::Propagation::Stop
+    });
+    tools.add_controller(tool_wheel);
     header.set_title_widget(Some(&tool_scroll));
     let copy = chrome::button(
         Icon::Copy,
@@ -1003,6 +1028,8 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
     legend.add_css_class("help-popover");
     for text in [
         "V  Select / move       S  Smart shape",
+        "X  Eraser: click / hold left button and drag; removes whole annotations, including privacy masks",
+        "Eraser: Ctrl+Z restores one gesture; Esc stops and keeps removals",
         "P  Freehand    A  Arrow    L  Line    R  Rectangle",
         "E  Ellipse      T  Text      C  Crop",
         "B  Privacy zone    N  Numbered step    M  Magnifier    H  Spotlight",
@@ -1093,6 +1120,11 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         "Smart redaction",
         "Review sensitive text matches before applying opaque masks",
     );
+    let table_copy = more(
+        Icon::Table,
+        "Copy OCR table",
+        "Preview recognised text as a table and copy TSV, CSV or Markdown",
+    );
     let toggle_pins = more(
         Icon::Pin,
         "Hide or show pins",
@@ -1102,6 +1134,11 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         Icon::Scroll,
         "Scrolling capture",
         "Capture a long page with guided scrolling and seam review",
+    );
+    let record_capture = more(
+        Icon::Record,
+        "Record screen region",
+        "Record a short clip, preview, trim and export GIF or WebM",
     );
     let export_svg = more(
         Icon::Save,
@@ -1804,6 +1841,37 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
             }
         }
     ));
+    record_capture.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        view,
+        #[weak]
+        project_popover,
+        move |_| {
+            project_popover.popdown();
+            match std::env::current_exe()
+                .and_then(|exe| std::process::Command::new(exe).arg("--record").spawn())
+            {
+                Ok(_) => window.minimize(),
+                Err(error) => view
+                    .help
+                    .set_text(&format!("Cannot start recording: {error}")),
+            }
+        }
+    ));
+    table_copy.connect_clicked(glib::clone!(
+        #[weak]
+        window,
+        #[weak]
+        view,
+        #[weak]
+        project_popover,
+        move |_| {
+            project_popover.popdown();
+            view.ocr.table_preview(&window);
+        }
+    ));
     for (button, format) in [
         (&export_svg, crate::vector_export::Format::Svg),
         (&export_pdf, crate::vector_export::Format::Pdf),
@@ -1896,9 +1964,11 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         ("Saved styles", "", "", &style_presets),
         ("Autosave and recovery", "", "", &recovery_button),
         ("Smart redaction", "", "", &smart_redact),
+        ("Copy OCR table", "", "", &table_copy),
         ("Pin screenshot", "", "", &pin_button),
         ("Hide or show pins", "", "", &toggle_pins),
         ("Scrolling capture", "", "", &scroll_capture),
+        ("Record screen region", "", "", &record_capture),
         ("Fit image", "fit", "0", &fit),
         ("Zoom in", "zoom-in", "Ctrl+plus", &plus),
         ("Zoom out", "zoom-out", "Ctrl+minus", &minus),
@@ -2010,6 +2080,17 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
                             #[weak]
                             view,
                             move || view.ocr.copy_text()
+                        ),
+                    );
+                    menu.action(
+                        Icon::Table,
+                        "Copy as table…",
+                        glib::clone!(
+                            #[weak]
+                            view,
+                            #[weak]
+                            window,
+                            move || view.ocr.table_preview(&window)
                         ),
                     );
                     if text.selected {
@@ -2380,7 +2461,13 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         state,
         #[weak]
         view,
-        move |_| view.refresh(&state.borrow())
+        move |toggle| {
+            let mut state = state.borrow_mut();
+            if toggle.is_active() {
+                state.cancel();
+            }
+            view.refresh(&state);
+        }
     ));
     for button in [&designer, &resize] {
         button.connect_clicked(glib::clone!(
@@ -2566,6 +2653,9 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
                 return;
             }
             let mut s = state.borrow_mut();
+            if s.tool == Tool::Eraser {
+                return;
+            }
             let p = s.transform.point(x, y, &s.doc);
             if let Some(id) = s.doc.hit_test(p, 0.) {
                 if s.edit_text(id) {
@@ -2816,6 +2906,12 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         view,
         move |controller, x, y| {
             view.area.grab_focus();
+            if view.panning.get().is_some() {
+                return;
+            }
+            if state.borrow().tool == Tool::Eraser {
+                view.ocr.cancel();
+            }
             if view.ocr.enabled() {
                 view.ocr.begin(
                     x,
@@ -2923,6 +3019,7 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
         view,
         move |controller, x, y| {
             controller.set_state(gtk::EventSequenceState::Claimed);
+            view.ocr.cancel();
             let mut state = state.borrow_mut();
             state.cancel();
             if state.zoom.is_none() {
@@ -2931,7 +3028,7 @@ fn build(app: &gtk::Application, doc: Document, settings: Rc<Settings>) {
                 zoom(&mut state, &view, Some(scale), Some((x, y)));
             }
             view.panning.set(Some((0., 0.)));
-            view.refresh_cursor(&state);
+            view.refresh(&state);
         }
     ));
     pan.connect_drag_update(glib::clone!(
@@ -3888,6 +3985,50 @@ mod tests {
         assert_eq!(image.get_pixel(3, 3).0, [0, 0, 0, 255]);
         assert_eq!(image.get_pixel(0, 0).0, [220, 30, 40, 255]);
         assert_eq!(doc.render()?.get_pixel(3, 3).0, [220, 30, 40, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn eraser_scene_and_worker_output_restore_original_pixels_and_undo_masks() -> Result<()> {
+        let original = image::RgbaImage::from_fn(64, 40, |x, y| {
+            image::Rgba([x as u8 * 3, y as u8 * 5, 120, 255])
+        });
+        let mut doc = Document::new(original.clone())?;
+        for (id, x) in [(1, 2.), (2, 40.)] {
+            doc.add(crate::document::Mark::redaction(
+                id,
+                Point { x, y: 2. },
+                Point { x: x + 10., y: 12. },
+            ));
+        }
+        let masked = doc.render()?;
+        let mut state = State::new(doc, std::sync::mpsc::channel().0);
+        state.tool = Tool::Eraser;
+        let cached_revision = state.doc.revision();
+        state.begin(5., 5., false, false, false);
+        assert!(state.gesture.is_some());
+        assert_ne!(state.doc.revision(), cached_revision);
+        assert!(!dynamic_scene(&state));
+        assert_eq!(
+            state.doc.render()?.get_pixel(5, 5),
+            original.get_pixel(5, 5)
+        );
+        state.update(40., 0., false, false);
+        assert_eq!(state.doc.render()?, original);
+        state.finish();
+        let RenderedOutput::Copy(erased) =
+            render_snapshot(Snapshot::capture(&state.doc)?, RenderAction::AutoCopy)?
+        else {
+            panic!("expected clipboard image")
+        };
+        assert_eq!(erased, original);
+        state.doc.undo();
+        let RenderedOutput::Copy(restored) =
+            render_snapshot(Snapshot::capture(&state.doc)?, RenderAction::Copy)?
+        else {
+            panic!("expected clipboard image")
+        };
+        assert_eq!(restored, masked);
         Ok(())
     }
 

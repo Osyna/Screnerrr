@@ -16,6 +16,7 @@ pub const HIGHLIGHT_ALPHA: f64 = 0.4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Select,
+    Eraser,
     Smart,
     Ink,
     Arrow,
@@ -72,6 +73,10 @@ pub enum DragKind {
 }
 pub enum Gesture {
     Draw(Mark),
+    Erase {
+        last: Point,
+        erased: bool,
+    },
     Crop {
         start: Point,
         preview: Option<Crop>,
@@ -403,6 +408,10 @@ impl State {
         );
     }
     pub fn cancel(&mut self) {
+        // Erasing is immediate: Esc stops the stroke but keeps its deletions undoable.
+        if matches!(self.gesture, Some(Gesture::Erase { .. })) {
+            self.doc.finish_erase();
+        }
         self.gesture = None;
         self.hovered = None;
     }
@@ -582,6 +591,12 @@ impl State {
         let p = self.transform.point(x, y, &self.doc);
         self.anchor = p;
         match self.tool {
+            Tool::Eraser => {
+                self.selected.clear();
+                self.doc.begin_erase();
+                let erased = self.doc.erase_at(p, (6. / self.transform.scale) as f32);
+                self.gesture = Some(Gesture::Erase { last: p, erased });
+            }
             Tool::Select => {
                 if let Some(id) = self.doc.hit_test(p, (6. / self.transform.scale) as f32) {
                     let group = self.doc.expand_groups(&[id]);
@@ -732,6 +747,27 @@ impl State {
             .point(self.origin.0 + dx, self.origin.1 + dy, &self.doc);
         let start = self.anchor;
         match &mut self.gesture {
+            Some(Gesture::Erase { last, erased }) => {
+                let tolerance = (6. / self.transform.scale) as f32;
+                if let Some((a, b)) = clip_erase(*last, raw, self.doc.width, self.doc.height)
+                    && tolerance.is_finite()
+                    && tolerance > 0.
+                {
+                    let distance = (b.x - a.x).hypot(b.y - a.y);
+                    // At most three screen pixels between hits, even when events are sparse.
+                    // shortcut: this bound covers MAX_DIM at 4× zoom; raise with supported zoom.
+                    let steps = ((distance / (tolerance / 2.)).ceil() as usize).min(65_536);
+                    for i in 1..=steps {
+                        let t = i as f32 / steps as f32;
+                        let q = pt(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                        *erased |= self.doc.erase_at(q, tolerance);
+                        if self.doc.marks.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                *last = raw;
+            }
             Some(Gesture::Transform {
                 kind,
                 bounds,
@@ -914,6 +950,10 @@ impl State {
     }
     pub fn finish(&mut self) -> Option<&'static str> {
         match self.gesture.take()? {
+            Gesture::Erase { erased, .. } => {
+                self.doc.finish_erase();
+                erased.then_some("Annotations erased · Ctrl+Z restores the whole stroke.")
+            }
             Gesture::Transform { matrix, .. } => self
                 .doc
                 .transform_marks(&self.selected, matrix)
@@ -1060,6 +1100,35 @@ impl State {
             .find(|(_, q)| (q.x - p.x).hypot(q.y - p.y) <= r)
             .map(|(i, _)| i)
     }
+}
+
+/// Clip the swept eraser to the image, rather than dragging a clamped cursor along its edge.
+fn clip_erase(a: Point, b: Point, width: u32, height: u32) -> Option<(Point, Point)> {
+    if ![a.x, a.y, b.x, b.y].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let (mut enter, mut exit) = (0_f64, 1_f64);
+    for (start, end, size) in [(a.x, b.x, width), (a.y, b.y, height)] {
+        let (start, delta) = (f64::from(start), f64::from(end) - f64::from(start));
+        if delta == 0. {
+            if start < 0. || start > f64::from(size) {
+                return None;
+            }
+        } else {
+            let (lo, hi) = (-start / delta, (f64::from(size) - start) / delta);
+            enter = enter.max(lo.min(hi));
+            exit = exit.min(lo.max(hi));
+        }
+    }
+    (enter <= exit).then(|| {
+        let at = |t: f64| {
+            pt(
+                (f64::from(a.x) + (f64::from(b.x) - f64::from(a.x)) * t) as f32,
+                (f64::from(a.y) + (f64::from(b.y) - f64::from(a.y)) * t) as f32,
+            )
+        };
+        (at(enter), at(exit))
+    })
 }
 /// True when the expanded selection contains text, which must only ever scale uniformly.
 fn has_text(doc: &Document, ids: &[u64]) -> bool {
@@ -1460,6 +1529,230 @@ mod tests {
             2.,
         ));
         id
+    }
+
+    #[test]
+    fn eraser_press_hits_topmost_ink_and_release_does_not_peel_another_layer() {
+        let mut s = state();
+        let bottom = rectangle(&mut s, 50.);
+        let top = rectangle(&mut s, 50.);
+        s.tool = Tool::Eraser;
+        s.begin(75., 75., false, false, false);
+        assert!(s.finish().is_none(), "unfilled interiors are not ink");
+        assert_eq!(s.doc.marks.len(), 2);
+        s.begin(75., 50., false, false, false);
+        assert!(s.doc.mark(top).is_none(), "press removes immediately");
+        assert!(s.doc.mark(bottom).is_some());
+        s.update(0., 0., false, false);
+        assert!(s.finish().is_some());
+        assert!(s.doc.mark(bottom).is_some(), "release is not another hit");
+        s.doc.undo();
+        assert_eq!(
+            s.doc.marks.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [bottom, top]
+        );
+        s.doc.redo();
+        assert!(s.doc.mark(top).is_none() && s.doc.mark(bottom).is_some());
+    }
+
+    #[test]
+    fn eraser_does_not_draw_along_the_image_edge_while_pointer_is_outside() {
+        let mut s = state();
+        let id = s.doc.id();
+        s.doc.add(Mark::path(
+            id,
+            vec![pt(0., 200.), pt(0., 250.)],
+            false,
+            [1., 0., 0., 1.],
+            2.,
+        ));
+        s.tool = Tool::Eraser;
+        s.begin(-10., 220., false, false, false);
+        assert!(s.gesture.is_none());
+        s.begin(30., 30., false, false, false);
+        s.update(-130., 0., false, false);
+        s.update(-130., 240., false, false);
+        s.finish();
+        assert!(
+            s.doc.mark(id).is_some(),
+            "clamping outside motion would incorrectly erase the edge"
+        );
+        s.begin(30., 220., false, false, false);
+        s.update(-130., 0., false, false);
+        s.finish();
+        assert!(
+            s.doc.mark(id).is_none(),
+            "the actual crossing of the canvas edge still erases"
+        );
+        s.doc.undo();
+        assert!(s.doc.mark(id).is_some());
+    }
+
+    #[test]
+    fn eraser_sparse_sweep_respects_zoom_transforms_and_interior_click_through() {
+        for scale in [0.25, 1., 4.] {
+            let mut s = state();
+            let id = s.doc.id();
+            let mut mark = Mark::path(
+                id,
+                vec![pt(0., 0.), pt(0., 40.)],
+                false,
+                [1., 0., 0., 1.],
+                0.1,
+            );
+            mark.transform = Affine::translation(pt(123., 140.))
+                .multiply(Affine::rotation_about(0.4, pt(0., 0.)));
+            s.doc.add(mark);
+            let outline = rectangle(&mut s, 100.);
+            s.tool = Tool::Eraser;
+            s.transform = Transform {
+                scale,
+                x: 17.,
+                y: 29.,
+            };
+            s.begin(17. + 50. * scale, 29. + 160. * scale, false, false, false);
+            s.update(150. * scale, 0., false, false);
+            assert!(
+                s.doc.mark(id).is_none(),
+                "a sparse event crossed the transformed thin line"
+            );
+            assert!(
+                s.doc.mark(outline).is_some(),
+                "the sweep did not touch this outline"
+            );
+            s.finish();
+            s.doc.undo();
+            assert!(s.doc.mark(id).is_some());
+            s.doc.redo();
+            assert!(s.doc.mark(id).is_none());
+        }
+        let mut s = state();
+        let line = s.doc.id();
+        s.doc.add(Mark::path(
+            line,
+            vec![pt(60., 75.), pt(90., 75.)],
+            false,
+            [1., 0., 0., 1.],
+            2.,
+        ));
+        let outline = rectangle(&mut s, 50.);
+        s.tool = Tool::Eraser;
+        s.begin(75., 75., false, false, false);
+        s.finish();
+        assert!(s.doc.mark(line).is_none() && s.doc.mark(outline).is_some());
+    }
+
+    #[test]
+    fn eraser_sweep_groups_links_and_step_numbers_restore_in_one_undo() {
+        use crate::document::{Anchor, Endpoint};
+        let mut s = state();
+        let a = rectangle(&mut s, 50.);
+        let b = rectangle(&mut s, 150.);
+        assert!(s.doc.group_marks(&[a, b]));
+        let connector = s.doc.id();
+        s.doc.add(Mark::connector(
+            connector,
+            Endpoint {
+                point: pt(100., 75.),
+                anchor: Some(Anchor {
+                    mark: a,
+                    u: 1.,
+                    v: 0.5,
+                }),
+            },
+            Endpoint {
+                point: pt(450., 75.),
+                anchor: None,
+            },
+            [1., 0., 0., 1.],
+            2.,
+        ));
+        let ends = s.doc.connector_ends(connector).unwrap();
+        let mut steps = vec![];
+        for (number, x) in [(1, 100.), (2, 200.), (3, 300.)] {
+            let id = s.doc.id();
+            s.doc
+                .add(Mark::step(id, pt(x, 200.), number, [1., 0., 0., 1.], 4.));
+            steps.push(id);
+        }
+        let before = s.doc.marks.clone();
+        s.tool = Tool::Eraser;
+        s.begin(50., 75., false, false, false);
+        assert!(s.doc.mark(a).is_none() && s.doc.mark(b).is_none());
+        assert_eq!(s.doc.connector_ends(connector).unwrap(), ends);
+        assert!(matches!(
+            s.doc.mark(connector).unwrap().kind,
+            MarkKind::Connector {
+                start: Endpoint { anchor: None, .. },
+                ..
+            }
+        ));
+        s.update(0., 125., false, false);
+        s.update(150., 125., false, false);
+        s.finish();
+        assert!(s.doc.mark(steps[0]).is_none() && s.doc.mark(steps[1]).is_none());
+        assert!(matches!(
+            s.doc.mark(steps[2]).unwrap().kind,
+            MarkKind::Step { number: 1 }
+        ));
+        let erased = s.doc.marks.clone();
+        s.doc.undo();
+        assert_eq!(s.doc.marks, before);
+        s.doc.redo();
+        assert_eq!(s.doc.marks, erased);
+    }
+
+    #[test]
+    fn eraser_empty_stroke_preserves_redo_and_cancel_keeps_one_undoable_stroke() {
+        let mut s = state();
+        s.tool = Tool::Eraser;
+        let rev = s.doc.revision();
+        s.begin(10., 10., false, false, false);
+        s.update(20., 0., false, false);
+        assert!(s.finish().is_none());
+        assert!(!s.doc.can_undo());
+        assert_eq!(s.doc.revision(), rev);
+        let a = rectangle(&mut s, 50.);
+        s.doc.undo();
+        assert!(s.doc.can_redo());
+        s.begin(10., 10., false, false, false);
+        s.cancel();
+        assert!(s.doc.can_redo());
+        s.doc.redo();
+        s.begin(75., 50., false, false, false);
+        assert!(s.doc.mark(a).is_none());
+        s.cancel();
+        assert!(s.gesture.is_none() && s.finish().is_none());
+        assert!(s.doc.mark(a).is_none(), "Esc keeps visible removals");
+        s.doc.undo();
+        assert!(s.doc.mark(a).is_some());
+    }
+
+    #[test]
+    fn eraser_does_not_absorb_an_intervening_edit_and_late_recognition_reaches_undo() {
+        let mut s = state();
+        let a = rectangle(&mut s, 50.);
+        let b = rectangle(&mut s, 150.);
+        s.tool = Tool::Eraser;
+        s.begin(75., 50., false, false, false);
+        let recognized = vec![pt(50., 50.), pt(100., 100.)];
+        assert!(s.doc.snap(a, recognized.clone(), false));
+        let c = rectangle(&mut s, 250.);
+        s.update(100., 0., false, false);
+        s.finish();
+        assert!(
+            s.doc.mark(b).is_some(),
+            "another edit sealed the eraser stroke"
+        );
+        s.doc.undo();
+        assert!(s.doc.mark(c).is_none() && s.doc.mark(a).is_none());
+        s.doc.undo();
+        assert_eq!(s.doc.mark(a).unwrap().points, recognized);
+        assert!(s.doc.mark(b).is_some());
+        s.doc.redo();
+        assert!(s.doc.mark(a).is_none() && s.doc.mark(b).is_some());
+        s.doc.redo();
+        assert!(s.doc.mark(c).is_some());
     }
     #[test]
     fn gesture_preview_cancel_and_commit_preserve_batch_history() {
